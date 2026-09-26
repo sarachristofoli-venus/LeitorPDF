@@ -3,7 +3,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('leitor', {
   initialFiles: () => ipcRenderer.invoke('initial-files'),
-  openDialog: () => ipcRenderer.invoke('open-dialog'),
+  openDialog: (kind) => ipcRenderer.invoke('open-dialog', kind),
   readFile: (file) => ipcRenderer.invoke('read-file', file),
   fileStat: (file) => ipcRenderer.invoke('file-stat', file),
   storeGet: () => ipcRenderer.invoke('store-get'),

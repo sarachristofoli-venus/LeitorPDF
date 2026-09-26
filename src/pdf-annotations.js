@@ -98,7 +98,8 @@ function buildAnnotation(doc, a, pageRef) {
  * @returns {{ok:true, refs:Object<string,string>} | {error:string, message?:string}}
  */
 async function saveAnnotations(job) {
-  const bytes = await fs.promises.readFile(job.src);
+  // documentos novos ou modificados em memória (OCR, imagens) chegam como bytes
+  const bytes = job.srcBytes ? job.srcBytes : await fs.promises.readFile(job.src);
   let doc;
   try {
     doc = await PDFDocument.load(bytes, { updateMetadata: false });

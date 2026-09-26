@@ -7,6 +7,15 @@ const crypto = require('crypto');
 const { saveAnnotations } = require('./pdf-annotations');
 
 const ROOT = app.getAppPath();
+const OCR_CORE_DIR = (() => {
+  for (const dir of [
+    path.join(ROOT, 'node_modules', 'tesseract.js-core'),
+    path.join(ROOT, 'node_modules', 'tesseract.js', 'node_modules', 'tesseract.js-core'),
+  ]) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+  }
+  return path.join(ROOT, 'node_modules', 'tesseract.js-core');
+})();
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -54,7 +63,7 @@ function writeJson(file, data) {
 function pdfArgs(argv, cwd = process.cwd()) {
   return argv
     .slice(1)
-    .filter((a) => !a.startsWith('-') && /\.pdf$/i.test(a))
+    .filter((a) => !a.startsWith('-') && /\.(pdf|jpe?g|jfif|png|webp|bmp|gif)$/i.test(a))
     .map((a) => path.resolve(cwd, a))
     .filter((a) => fs.existsSync(a));
 }
@@ -104,6 +113,11 @@ function createWindow() {
   win.loadURL('app://leitor/src/index.html');
 }
 
+// Aceleração por GPU desligada por padrão: o PDF.js já desenha as páginas na CPU, e com a GPU ligada
+// alguns drivers travam o processo da GPU ao ler imagens grandes (OCR, impressão). Para religar,
+// defina "gpu": true em %APPDATA%\Leitor PDF\dados.json.
+if (!readJson(dataFile(), {}).gpu) app.disableHardwareAcceleration();
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -122,7 +136,13 @@ if (!app.requestSingleInstanceLock()) {
 
     protocol.handle('app', async (request) => {
       const url = new URL(request.url);
-      const file = path.normalize(path.join(ROOT, decodeURIComponent(url.pathname)));
+      let rel = decodeURIComponent(url.pathname);
+      // modelos de idioma do OCR: /tessdata/por.traineddata.gz → pacote @tesseract.js-data/por
+      const lang = rel.match(/^\/tessdata\/([a-z_]+)\.traineddata\.gz$/);
+      if (lang) rel = `/node_modules/@tesseract.js-data/${lang[1]}/4.0.0_best_int/${lang[1]}.traineddata.gz`;
+      // motor do OCR: a pasta do tesseract.js-core muda conforme o npm/electron-builder organiza as dependências
+      const core = rel.match(/^\/ocr-core\/([\w.-]+\.js)$/);
+      const file = core ? path.join(OCR_CORE_DIR, core[1]) : path.normalize(path.join(ROOT, rel));
       if (!file.startsWith(ROOT)) return new Response('Proibido', { status: 403 });
       try {
         const body = await fs.promises.readFile(file);
@@ -140,11 +160,20 @@ if (!app.requestSingleInstanceLock()) {
       return files;
     });
 
-    ipcMain.handle('open-dialog', async () => {
+    const IMAGE_EXT = ['jpg', 'jpeg', 'jfif', 'png', 'webp', 'bmp', 'gif'];
+    ipcMain.handle('open-dialog', async (_e, kind) => {
+      const images = kind === 'images';
       const res = await dialog.showOpenDialog(win, {
-        title: 'Abrir PDF',
+        title: images ? 'Escolher imagens' : 'Abrir PDF ou imagens',
         properties: ['openFile', 'multiSelections'],
-        filters: [{ name: 'Documentos PDF', extensions: ['pdf'] }, { name: 'Todos os arquivos', extensions: ['*'] }],
+        filters: images
+          ? [{ name: 'Imagens', extensions: IMAGE_EXT }, { name: 'Todos os arquivos', extensions: ['*'] }]
+          : [
+            { name: 'PDF e imagens', extensions: ['pdf', ...IMAGE_EXT] },
+            { name: 'Documentos PDF', extensions: ['pdf'] },
+            { name: 'Imagens', extensions: IMAGE_EXT },
+            { name: 'Todos os arquivos', extensions: ['*'] },
+          ],
       });
       return res.canceled ? [] : res.filePaths;
     });
@@ -195,6 +224,8 @@ if (!app.requestSingleInstanceLock()) {
     });
 
     ipcMain.handle('save-dialog', async (_e, defaultPath) => {
+      // testes automatizados: responde a caixa "Salvar como" sem abri-la
+      if (process.env.LEITOR_AUTOSAVE_DIR) return path.join(process.env.LEITOR_AUTOSAVE_DIR, path.basename(String(defaultPath)));
       const res = await dialog.showSaveDialog(win, {
         title: 'Salvar PDF como',
         defaultPath: String(defaultPath || ''),

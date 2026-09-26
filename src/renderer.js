@@ -30,6 +30,8 @@ const icon = (id, cls) => {
   return s;
 };
 const basename = (p) => p.split(/[\\/]/).pop();
+const dirname = (p) => p.replace(/[\\/][^\\/]*$/, '');
+const IMG_RE = /\.(jpe?g|jfif|png|webp|bmp|gif)$/i;
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const debounce = (fn, ms) => {
   let t;
@@ -58,7 +60,7 @@ function addRecent(path, title) {
 }
 
 function savePosition(doc) {
-  if (!doc.pdf) return;
+  if (!doc.pdf || !doc.path) return;
   store.positions[doc.path] = { page: doc.currentPage, zoom: doc.zoomMode, rotation: doc.rotation, at: Date.now() };
   const keys = Object.keys(store.positions);
   if (keys.length > 300) {
@@ -92,9 +94,12 @@ const state = { docs: [], active: null, presentation: false, fullscreen: false, 
 
 // ================================================================= Documento
 class Doc {
-  constructor(path) {
+  constructor(path, { bytes = null, name = null, dir = null } = {}) {
     this.path = path;
-    this.name = basename(path);
+    this.name = name || basename(path);
+    this.dir = dir || (path ? dirname(path) : null);
+    this.bytes = bytes;          // conteúdo em memória: documento novo ou alterado pelo OCR
+    this.contentDirty = !!bytes;
     this.title = this.name;
     this.pdf = null;
     this.task = null;
@@ -108,6 +113,7 @@ class Doc {
     this.search = null;
     this.searchToken = 0;
     this.closed = false;
+    this.docGen = 0; // muda a cada recarga do conteúdo
 
     // anotações
     this.annots = [];
@@ -132,7 +138,7 @@ class Doc {
 
     this.tabEl = el('div', 'tab');
     this.tabEl.setAttribute('role', 'tab');
-    this.tabEl.title = path;
+    this.tabEl.title = path || this.name;
     const close = el('button', 'close');
     close.title = 'Fechar (Ctrl+W)';
     close.append(icon('close'));
@@ -223,8 +229,8 @@ class Doc {
   }
 
   // ------------------------------------------------------------ Carregamento
-  async load() {
-    const data = await api.readFile(this.path);
+  async load({ restore = null } = {}) {
+    const data = this.bytes ? this.bytes.slice() : await api.readFile(this.path);
     if (this.closed) return;
     this.task = pdfjsLib.getDocument({
       data,
@@ -247,7 +253,7 @@ class Doc {
     this.meta = meta;
 
     // anotações guardadas pelo app (PDFs protegidos)
-    const side = await api.sidecarGet(this.path).catch(() => null);
+    const side = this.path && !restore ? await api.sidecarGet(this.path).catch(() => null) : null;
     if (side?.annots) {
       this.sidecarMode = true;
       this.hiddenRefs = new Set(side.hiddenRefs || []);
@@ -272,7 +278,7 @@ class Doc {
       this.observer.observe(div);
     }
 
-    const saved = store.positions[this.path];
+    const saved = restore || (this.path ? store.positions[this.path] : null);
     if (saved) {
       this.rotation = saved.rotation || 0;
       this.zoomMode = saved.zoom ?? 'auto';
@@ -283,16 +289,88 @@ class Doc {
 
     this.buildThumbs();
     this.buildOutline();
-    addRecent(this.path, this.title);
+    if (this.path && !restore) addRecent(this.path, this.title);
+    this.updateDirty();
     if (state.active === this) { updateUI(); showSideTab(store.sideTab); }
     this.backgroundScan();
+    this.checkScanned();
+  }
+
+  /** Desmonta as páginas (para recarregar o documento a partir de novos bytes). */
+  teardownPages() {
+    closePopover(true);
+    hideSelBar();
+    this.observer.disconnect();
+    this.thumbObserver.disconnect();
+    for (const p of this.pages) {
+      p.renderTask?.cancel();
+      if (p.textDiv) unregisterTextLayer(p.textDiv);
+    }
+    this.pages = [];
+    this.docGen++; // invalida leituras ainda em andamento do conteúdo anterior
+    this.visible.clear();
+    this.textCache.clear();
+    this.searchToken++;
+    this.search = null;
+    this.lastThumb = null;
+    this.pagesEl.textContent = '';
+    this.thumbsEl.textContent = '';
+    this.outlineEl.textContent = '';
+  }
+
+  /** Substitui o conteúdo (ex.: depois do OCR) mantendo página, zoom e anotações. */
+  async reloadFromBytes(bytes) {
+    const restore = { page: this.currentPage, zoom: this.zoomMode, rotation: this.rotation };
+    this.teardownPages();
+    const old = this.pdf;
+    this.pdf = null;
+    this.task = null;
+    await old?.destroy();
+    this.bytes = bytes;
+    this.contentDirty = true;
+    this.hideScanBanner();
+    await this.load({ restore });
+  }
+
+  /** Detecta PDFs digitalizados (sem texto) e oferece o OCR. */
+  async checkScanned() {
+    const n = Math.min(3, this.pages.length);
+    let chars = 0;
+    try {
+      for (let i = 1; i <= n; i++) chars += (await this.getText(i)).text.replace(/\s+/g, '').length;
+    } catch { return; }
+    if (this.closed) return;
+    this.scanned = n > 0 && chars < 10;
+    if (this.scanned && !this.bannerDismissed) this.showScanBanner();
+    else this.hideScanBanner();
+  }
+
+  showScanBanner() {
+    if (this.banner) return;
+    const b = el('div', 'scan-banner');
+    b.append(icon('ocr'), el('span', null, 'Este PDF parece ser digitalizado: o texto ainda não pode ser selecionado, copiado nem pesquisado.'));
+    const go = el('button', 'primary small', 'Reconhecer texto (OCR)');
+    go.addEventListener('click', () => showOcrDialog(this));
+    const x = el('button', 'icon-btn small');
+    x.title = 'Fechar aviso';
+    x.append(icon('close'));
+    x.addEventListener('click', () => { this.bannerDismissed = true; this.hideScanBanner(); });
+    b.append(go, x);
+    this.viewer.prepend(b);
+    this.banner = b;
+  }
+
+  hideScanBanner() {
+    this.banner?.remove();
+    this.banner = null;
   }
 
   // Em segundo plano: tamanho real de cada página e anotações existentes
   async backgroundScan() {
+    const gen = this.docGen;
     let changed = false;
     for (let i = 1; i <= this.pages.length; i++) {
-      if (this.closed) return;
+      if (this.closed || gen !== this.docGen) return;
       const p = this.pages[i - 1];
       try {
         const page = p.page || (p.page = await this.pdf.getPage(i));
@@ -557,7 +635,7 @@ class Doc {
       await this.renderTextLayer(p, page, viewport, gen);
       if (gen === p.gen) this.renderLinks(p, viewport);
     } catch (err) {
-      if (err?.name !== 'RenderingCancelledException') console.error('Erro ao renderizar página', p.num, err);
+      if (err?.name !== 'RenderingCancelledException' && err?.message !== 'Documento recarregado') console.error('Erro ao renderizar página', p.num, err);
     } finally {
       if (gen === p.gen) p.pendingKey = null;
     }
@@ -566,9 +644,13 @@ class Doc {
   async getText(num) {
     let tc = this.textCache.get(num);
     if (!tc) {
+      const gen = this.docGen;
       const p = this.pages[num - 1];
+      if (!p || !this.pdf) throw new Error('Documento recarregado');
       const page = p.page || (p.page = await this.pdf.getPage(num));
       const content = await page.getTextContent();
+      // o documento foi recarregado (ex.: OCR) enquanto o texto era lido: descarta o resultado antigo
+      if (gen !== this.docGen) throw new Error('Documento recarregado');
       const items = content.items.filter((it) => it.str !== undefined);
       // Texto da página: um espaço virtual após cada fim de linha para a busca atravessar linhas
       const offsets = [];
@@ -646,7 +728,7 @@ class Doc {
           if (!a) continue;
           // o PDF.js deixa de desenhar a original; o app passa a desenhá-la (e permite editá-la)
           this.pdf.annotationStorage.setValue(d.id, { noView: true, noPrint: true });
-          if (this.hiddenRefs.has(d.id)) continue;
+          if (this.hiddenRefs.has(d.id) || this.importedSnap.has(d.id)) continue;
           added.push(a);
           this.importedSnap.set(a.ref, A.snapshotOf(a));
         }
@@ -902,7 +984,7 @@ class Doc {
 
   updateDirty() {
     const { remove, add } = this.diff();
-    const dirty = remove.length + add.length > 0;
+    const dirty = this.contentDirty || remove.length + add.length > 0;
     if (dirty === this.dirty) return;
     this.dirty = dirty;
     this.tabEl.classList.toggle('dirty', dirty);
@@ -917,12 +999,16 @@ class Doc {
 
   async save(saveAs = false) {
     if (this.saving || !this.pdf) return false;
+    if (!this.path) saveAs = true; // documento novo: sempre pergunta onde salvar
     const { remove, add } = this.diff();
     let dest = this.path;
     if (saveAs) {
-      dest = await api.saveDialog(this.path.replace(/\.pdf$/i, '') + ' (anotado).pdf');
+      const suggestion = this.path
+        ? this.path.replace(/\.pdf$/i, '') + ' (cópia).pdf'
+        : (this.dir ? this.dir + '\\' : '') + this.name;
+      dest = await api.saveDialog(suggestion);
       if (!dest) return false;
-    } else if (!remove.length && !add.length) {
+    } else if (!remove.length && !add.length && !this.contentDirty) {
       return true;
     }
     if (this.sidecarMode) {
@@ -934,6 +1020,7 @@ class Doc {
     try {
       const res = await api.saveAnnotations({
         src: this.path,
+        srcBytes: this.bytes || undefined,
         dest,
         remove: remove.filter((r) => !r.startsWith('side:')),
         add: add.map((a) => ({ ...A.plain(a), author: a.author || state.author })),
@@ -951,15 +1038,21 @@ class Doc {
         return false;
       }
       for (const a of add) if (res.refs[a.id]) a.ref = res.refs[a.id];
+      const hadContent = this.contentDirty;
       if (dest !== this.path) {
+        const oldName = this.name;
         this.path = dest;
         this.name = basename(dest);
+        this.dir = dirname(dest);
         this.tabEl.title = dest;
-        if (this.title === basename(this.path)) this.title = this.name;
+        if (this.title === oldName) this.title = this.name;
         addRecent(dest, this.title);
       }
+      this.bytes = null;
+      this.contentDirty = false;
       this.resetBaseline();
-      toast(saveAs ? `Salvo como “${this.name}”.` : 'Anotações salvas no PDF.', 2500);
+      if (state.active === this) updateUI();
+      toast(saveAs ? `Salvo como “${this.name}”.` : hadContent ? 'Documento salvo.' : 'Anotações salvas no PDF.', 2500);
       return true;
     } catch (err) {
       toast('Não foi possível salvar: ' + (err?.message || err), 7000);
@@ -1076,6 +1169,7 @@ class Doc {
         { sep: true },
       );
     }
+    items.push({ label: 'Reconhecer texto (OCR)…', icon: 'ocr', kbd: 'Ctrl+Shift+O', action: () => showOcrDialog(this) }, { sep: true });
     items.push(
       { label: 'Desfazer', icon: 'undo', kbd: 'Ctrl+Z', disabled: !this.history.length, action: () => this.undo() },
       { label: 'Refazer', kbd: 'Ctrl+Y', disabled: !this.future.length, action: () => this.redo() },
@@ -1328,9 +1422,12 @@ class Doc {
 
 // ================================================================= Abas
 async function openPaths(paths) {
+  const images = paths.filter((p) => IMG_RE.test(p));
+  if (images.length) showImagesDialog(images);
+  paths = paths.filter((p) => !IMG_RE.test(p));
   let last = null;
   for (const path of paths) {
-    const existing = state.docs.find((d) => d.path.toLowerCase() === path.toLowerCase());
+    const existing = state.docs.find((d) => d.path && d.path.toLowerCase() === path.toLowerCase());
     if (existing) { last = existing; continue; }
     const doc = new Doc(path);
     state.docs.push(doc);
@@ -1356,6 +1453,20 @@ async function openPaths(paths) {
     }
   }
   if (last && !last.closed) activate(last);
+}
+
+async function openBytes(bytes, name, dir) {
+  const doc = new Doc(null, { bytes, name, dir });
+  state.docs.push(doc);
+  activate(doc);
+  try {
+    await doc.load();
+    return doc;
+  } catch (err) {
+    closeDoc(doc, false);
+    toast('Não foi possível abrir o PDF gerado: ' + (err?.message || err), 7000);
+    return null;
+  }
 }
 
 async function openDialog() {
@@ -1492,7 +1603,7 @@ function updateSearchUI() {
   if (!s.done) {
     status.textContent = total ? `${s.current + 1} de ${total}+ …` : `Buscando… ${s.scanned}/${d.pages.length}`;
   } else if (!total) {
-    status.textContent = 'Nenhum resultado';
+    status.textContent = d.scanned ? 'Nenhum resultado (PDF sem texto: use o OCR)' : 'Nenhum resultado';
     input.classList.add('nores');
   } else {
     status.textContent = `${s.current + 1} de ${total}`;
@@ -1901,12 +2012,13 @@ function renderRecent() {
 
 // ---------------------------------------------------------------- Diálogos
 let modalResolve = null;
-function showModal(title, body, buttons) {
+function showModal(title, body, buttons, { wide = false } = {}) {
   return new Promise((resolve) => {
     modalResolve?.(null);
     modalResolve = resolve;
     const m = $('#modal');
     m.textContent = '';
+    m.classList.toggle('wide', wide);
     m.append(el('h3', null, title));
     if (typeof body === 'string') m.append(el('p', null, body)); else if (body) m.append(body);
     const actions = el('div', 'actions');
@@ -1999,7 +2111,8 @@ async function showProperties() {
 function showHelp() {
   const groups = [
     ['Arquivos e abas', [
-      ['Ctrl+O', 'Abrir arquivo'], ['Ctrl+S', 'Salvar anotações no PDF'], ['Ctrl+Shift+S', 'Salvar como…'],
+      ['Ctrl+O', 'Abrir PDF ou imagens'], ['Ctrl+S', 'Salvar'], ['Ctrl+Shift+S', 'Salvar como…'],
+      ['Ctrl+Shift+O', 'Reconhecer texto (OCR)'],
       ['Ctrl+W', 'Fechar aba'], ['Ctrl+Tab / Ctrl+Shift+Tab', 'Próxima / aba anterior'],
     ]],
     ['Navegação', [
@@ -2053,6 +2166,403 @@ function toast(msg, ms = 2500) {
   toastTimer = setTimeout(() => { t.hidden = true; }, ms);
 }
 
+// ---------------------------------------------------------------- Formulários simples
+function makeSelect(options, value) {
+  const s = el('select', 'field');
+  for (const [v, label] of options) {
+    const o = el('option', null, label);
+    o.value = v;
+    s.append(o);
+  }
+  if (value != null) s.value = value;
+  return s;
+}
+
+function makeCheck(label, checked) {
+  const row = el('label', 'check-row');
+  const input = el('input');
+  input.type = 'checkbox';
+  input.checked = !!checked;
+  row.append(input, el('span', null, label));
+  return { row, input };
+}
+
+function formRow(label, control) {
+  const r = el('label', 'form-row');
+  r.append(el('span', null, label), control);
+  return r;
+}
+
+function progressModal(title, onCancel) {
+  const body = el('div', 'progress-body');
+  const label = el('p', null, 'Preparando…');
+  const bar = el('div', 'pbar');
+  const fill = el('div', 'pbar-fill');
+  bar.append(fill);
+  const sub = el('p', 'muted small', '');
+  body.append(label, bar, sub);
+  let closed = false;
+  showModal(title, body, [{ label: 'Cancelar', value: 'cancel' }]).then((v) => {
+    closed = true;
+    if (v === 'cancel' || v === null) onCancel?.();
+  });
+  return {
+    set(text, frac, subtext) {
+      if (text != null) label.textContent = text;
+      if (frac != null) fill.style.width = Math.round(clamp(frac, 0, 1) * 100) + '%';
+      if (subtext != null) sub.textContent = subtext;
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      $('#modal')._finish?.('done');
+    },
+  };
+}
+
+// ---------------------------------------------------------------- OCR de um PDF aberto
+async function showOcrDialog(d) {
+  if (!d?.pdf) return;
+  const OCR = await import('./ocr.js');
+  const body = el('div', 'form');
+  body.append(el('p', null, 'O reconhecimento de texto (OCR) transforma páginas digitalizadas ou fotografadas em texto que pode ser selecionado, copiado e pesquisado. Tudo é processado no seu computador, sem internet.'));
+  const langSel = makeSelect(OCR.LANGS, store.ocrLang || 'por+eng');
+  body.append(formRow('Idioma do texto', langSel));
+  body.append(el('div', 'form-label', 'Páginas'));
+  const radio = (value, label, checked) => {
+    const r = el('label', 'check-row');
+    const i = el('input');
+    i.type = 'radio'; i.name = 'ocrPages'; i.value = value; i.checked = checked;
+    r.append(i, el('span', null, label));
+    return r;
+  };
+  body.append(
+    radio('missing', 'Somente páginas sem texto (recomendado)', true),
+    radio('all', 'Todas as páginas', false),
+  );
+  const v = await showModal('Reconhecer texto (OCR)', body, [
+    { label: 'Cancelar', value: null },
+    { label: 'Reconhecer', value: 'ok', primary: true },
+  ]);
+  if (v !== 'ok') return;
+  store.ocrLang = langSel.value;
+  saveStore();
+  await ocrDocument(d, { lang: langSel.value, mode: body.querySelector('input[name=ocrPages]:checked').value });
+}
+
+async function ocrDocument(d, { lang, mode }) {
+  const [OCR, PB] = await Promise.all([import('./ocr.js'), import('./pdfbuild.js')]);
+  const signal = { cancelled: false };
+  const prog = progressModal('Reconhecendo texto', () => { signal.cancelled = true; signal.terminate?.(); });
+  try {
+    prog.set('Verificando as páginas…', 0);
+    const all = d.pages.map((p) => p.num);
+    const need = [];
+    for (const n of all) {
+      if (signal.cancelled) throw new OCR.OcrCancelled();
+      if (mode === 'all') { need.push(n); continue; }
+      const tc = await d.getText(n).catch(() => null);
+      if (!tc || tc.text.replace(/\s+/g, '').length < 3) need.push(n);
+    }
+    if (!need.length) {
+      prog.close();
+      toast('Todas as páginas já têm texto selecionável. Para refazer o OCR, escolha “Todas as páginas”.', 6000);
+      return;
+    }
+    // Se o PDF não puder ser alterado (protegido), cria uma cópia com as páginas como imagens + texto
+    const original = d.bytes || (await api.readFile(d.path));
+    let target = null;
+    try { target = await PB.PDFDocument.load(original, { updateMetadata: false }); } catch { target = null; }
+    const rasterize = !target;
+    const pages = rasterize ? all : need;
+
+    const views = new Map();
+    const images = new Map();
+    const jobs = pages.map((n) => async () => {
+      const page = await d.pdf.getPage(n);
+      const base = page.getViewport({ scale: 1 });
+      const s = clamp(3000 / Math.max(base.width, base.height), 2, 300 / 72); // ~300 DPI
+      const vp = page.getViewport({ scale: s });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(vp.width);
+      canvas.height = Math.floor(vp.height);
+      // canvas na CPU (willReadFrequently): os pixels serão lidos pelo OCR; evita a leitura pela GPU,
+      // que pode travar o processo da GPU com imagens grandes enquanto a tela é desenhada
+      const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      views.set(n, vp);
+      if (rasterize) {
+        const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.85));
+        images.set(n, new Uint8Array(await blob.arrayBuffer()));
+      }
+      return canvas;
+    });
+    const results = await OCR.recognizeAll(jobs, {
+      lang,
+      signal,
+      onProgress: (done, total, frac) => prog.set(
+        `Reconhecendo texto… página ${Math.min(done + 1, total)} de ${total}`, 0.02 + frac * 0.93, `${Math.round(frac * 100)}%`),
+    });
+
+    prog.set('Montando o PDF pesquisável…', 0.96, '');
+    let words = 0;
+    if (!rasterize) {
+      const fi = await PB.ocrFont(target);
+      pages.forEach((n, i) => {
+        const vp = views.get(n);
+        const w = PB.wordsToPdf(results[i], (x, y) => vp.convertToPdfPoint(x, y), vp.scale);
+        words += w.length;
+        PB.addInvisibleText(target, target.getPage(n - 1), fi, w);
+      });
+      const bytes = await target.save({ useObjectStreams: false });
+      prog.close();
+      await d.reloadFromBytes(bytes);
+      toast(`Texto reconhecido em ${pages.length} ${pages.length === 1 ? 'página' : 'páginas'} (${words} palavras). Salve com Ctrl+S para manter.`, 6000);
+    } else {
+      const out = await PB.PDFDocument.create();
+      out.setProducer('Leitor PDF');
+      const fi = await PB.ocrFont(out);
+      for (const [i, n] of pages.entries()) {
+        const vp = views.get(n);
+        const pw = vp.width / vp.scale, ph = vp.height / vp.scale;
+        const page = out.addPage([pw, ph]);
+        page.drawImage(await out.embedJpg(images.get(n)), { x: 0, y: 0, width: pw, height: ph });
+        const w = PB.wordsToPdf(results[i], (x, y) => [x / vp.scale, ph - y / vp.scale], vp.scale);
+        words += w.length;
+        PB.addInvisibleText(out, page, fi, w);
+      }
+      const bytes = await out.save({ useObjectStreams: false });
+      prog.close();
+      await openBytes(bytes, d.name.replace(/\.pdf$/i, '') + ' (OCR).pdf', d.dir);
+      toast('Este PDF é protegido contra alterações, então foi criada uma cópia com o texto reconhecido. Salve-a com Ctrl+S.', 8000);
+    }
+  } catch (err) {
+    prog.close();
+    if (err?.name === 'OcrCancelled' || signal.cancelled) { toast('OCR cancelado.'); return; }
+    console.error(err);
+    toast('Falha no OCR: ' + (err?.message || err), 8000);
+  }
+}
+
+// ---------------------------------------------------------------- Imagens → PDF
+let imgDlg = null;
+
+/** Desenha a imagem já na orientação correta (EXIF + giro escolhido), limitada a maxSide pixels. */
+async function loadItemCanvas(it, maxSide) {
+  const bmp = await createImageBitmap(new Blob([it.bytes]), { imageOrientation: 'from-image' });
+  const rot = it.rotation;
+  const w = rot % 180 ? bmp.height : bmp.width;
+  const h = rot % 180 ? bmp.width : bmp.height;
+  const k = Math.min(1, maxSide / Math.max(w, h));
+  const cw = Math.max(1, Math.round(w * k)), ch = Math.max(1, Math.round(h * k));
+  const c = document.createElement('canvas');
+  c.width = cw;
+  c.height = ch;
+  const ctx = c.getContext('2d', { alpha: false, willReadFrequently: true });
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, cw, ch);
+  ctx.translate(cw / 2, ch / 2);
+  ctx.rotate((rot * Math.PI) / 180);
+  const dw = rot % 180 ? ch : cw, dh = rot % 180 ? cw : ch;
+  ctx.drawImage(bmp, -dw / 2, -dh / 2, dw, dh);
+  bmp.close();
+  return { canvas: c, w, h };
+}
+
+async function showImagesDialog(paths) {
+  if (imgDlg) { imgDlg.add(paths); return; }
+  const OCR = await import('./ocr.js');
+  const items = [];
+  const wrap = el('div', 'img-dlg');
+
+  const head = el('div', 'img-head');
+  const count = el('span', 'muted');
+  const sortBtn = el('button', 'secondary small', 'Ordenar por nome');
+  const addBtn = el('button', 'secondary small');
+  addBtn.append(icon('plus'), el('span', null, 'Adicionar imagens'));
+  head.append(count, el('span', 'grow'), sortBtn, addBtn);
+
+  const grid = el('div', 'img-grid');
+  const opts = el('div', 'img-opts');
+  const sizeSel = makeSelect([['fit', 'Formato da imagem'], ['a4', 'A4'], ['letter', 'Carta']], store.imgSize || 'fit');
+  const optimize = makeCheck('Reduzir o tamanho do arquivo', store.imgOptimize ?? true);
+  const ocr = makeCheck('Reconhecer texto (OCR): permite selecionar, copiar e pesquisar o texto', store.imgOcr ?? true);
+  const langSel = makeSelect(OCR.LANGS, store.ocrLang || 'por+eng');
+  langSel.disabled = !ocr.input.checked;
+  ocr.input.addEventListener('change', () => { langSel.disabled = !ocr.input.checked; });
+  opts.append(formRow('Tamanho da página', sizeSel), formRow('Idioma do texto', langSel), optimize.row, ocr.row);
+  wrap.append(head, grid, el('p', 'muted small', 'Arraste as miniaturas para mudar a ordem das páginas.'), opts);
+
+  const byName = (a, b) => a.name.localeCompare(b.name, 'pt-BR', { numeric: true });
+  let dragFrom = -1;
+  const render = () => {
+    grid.textContent = '';
+    count.textContent = items.length === 1 ? '1 imagem' : `${items.length} imagens`;
+    items.forEach((it, i) => {
+      const card = el('div', 'img-card');
+      card.draggable = true;
+      const box = el('div', 'img-box');
+      const img = el('img');
+      img.src = it.url;
+      img.draggable = false;
+      img.style.transform = `rotate(${it.rotation}deg)`;
+      box.append(img);
+      const name = el('div', 'img-name', it.name);
+      name.title = it.path;
+      const acts = el('div', 'img-acts');
+      const btn = (ic, title, fn) => {
+        const x = el('button', 'icon-btn small');
+        x.title = title;
+        x.append(icon(ic));
+        x.addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+        return x;
+      };
+      acts.append(
+        btn('rot-left', 'Girar para a esquerda', () => { it.rotation = (it.rotation + 270) % 360; render(); }),
+        btn('rotate', 'Girar para a direita', () => { it.rotation = (it.rotation + 90) % 360; render(); }),
+        btn('trash', 'Remover', () => { URL.revokeObjectURL(it.url); items.splice(items.indexOf(it), 1); render(); }),
+      );
+      card.append(box, el('span', 'img-num', String(i + 1)), name, acts);
+      card.addEventListener('dragstart', (e) => { dragFrom = i; card.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+      card.addEventListener('dragend', () => { dragFrom = -1; card.classList.remove('dragging'); });
+      card.addEventListener('dragover', (e) => { if (dragFrom < 0) return; e.preventDefault(); card.classList.add('drop-target'); });
+      card.addEventListener('dragleave', () => card.classList.remove('drop-target'));
+      card.addEventListener('drop', (e) => {
+        if (dragFrom < 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const [moved] = items.splice(dragFrom, 1);
+        items.splice(i, 0, moved);
+        dragFrom = -1;
+        render();
+      });
+      grid.append(card);
+    });
+    if (!items.length) grid.append(el('p', 'empty', 'Nenhuma imagem. Use “Adicionar imagens” ou arraste arquivos para cá.'));
+    const create = $('#modal .actions .primary');
+    if (create) create.disabled = !items.length;
+  };
+  const add = async (ps) => {
+    const batch = [];
+    for (const p of ps) {
+      try {
+        const bytes = await api.readFile(p);
+        batch.push({ path: p, name: basename(p), bytes, url: URL.createObjectURL(new Blob([bytes])), rotation: 0 });
+      } catch {
+        toast(`Não foi possível ler “${basename(p)}”.`, 4000);
+      }
+    }
+    items.push(...batch.sort(byName)); // a ordem de arrastar/soltar é imprevisível: usa a ordem dos nomes
+    render();
+  };
+  addBtn.addEventListener('click', async () => {
+    const files = await api.openDialog('images');
+    if (files.length) add(files);
+  });
+  sortBtn.addEventListener('click', () => { items.sort(byName); render(); });
+
+  imgDlg = { add };
+  const loading = add(paths);
+  const v = await showModal('Criar PDF a partir de imagens', wrap, [
+    { label: 'Cancelar', value: null },
+    { label: 'Criar PDF', value: 'ok', primary: true },
+  ], { wide: true });
+  imgDlg = null;
+  await loading;
+  try {
+    if (v === 'ok' && items.length) {
+      Object.assign(store, { imgSize: sizeSel.value, imgOptimize: optimize.input.checked, imgOcr: ocr.input.checked, ocrLang: langSel.value });
+      saveStore();
+      await createPdfFromImages(items, { size: sizeSel.value, optimize: optimize.input.checked, ocr: ocr.input.checked, lang: langSel.value });
+    }
+  } finally {
+    items.forEach((it) => URL.revokeObjectURL(it.url));
+  }
+}
+
+async function createPdfFromImages(items, opts) {
+  const [OCR, PB] = await Promise.all([import('./ocr.js'), import('./pdfbuild.js')]);
+  const signal = { cancelled: false };
+  const prog = progressModal('Criando PDF', () => { signal.cancelled = true; signal.terminate?.(); });
+  try {
+    const doc = await PB.PDFDocument.create();
+    doc.setProducer('Leitor PDF');
+    doc.setCreator('Leitor PDF');
+    const layouts = [];
+    const share = opts.ocr ? 0.25 : 0.95;
+    for (const [i, it] of items.entries()) {
+      if (signal.cancelled) throw new OCR.OcrCancelled();
+      prog.set(`Preparando imagem ${i + 1} de ${items.length}…`, (i / items.length) * share, it.name);
+      const jpg = PB.isJpeg(it.bytes), png = PB.isPng(it.bytes);
+      const exif = jpg ? PB.jpegOrientation(it.bytes) : 1;
+      const probe = await createImageBitmap(new Blob([it.bytes]), { imageOrientation: 'from-image' });
+      const w = it.rotation % 180 ? probe.height : probe.width;
+      const h = it.rotation % 180 ? probe.width : probe.height;
+      probe.close();
+      const tooBig = opts.optimize && Math.max(w, h) > 2480;
+      const bigPng = opts.optimize && png && it.bytes.length > 3e6;
+      let image;
+      if ((jpg || png) && !it.rotation && exif === 1 && !tooBig && !bigPng) {
+        image = jpg ? await doc.embedJpg(it.bytes) : await doc.embedPng(it.bytes); // sem perda: usa o arquivo original
+      } else {
+        const { canvas } = await loadItemCanvas(it, opts.optimize ? 2480 : 10000);
+        const asPng = (png && !bigPng) || (!jpg && !png && !opts.optimize);
+        const blob = await new Promise((r) => canvas.toBlob(r, asPng ? 'image/png' : 'image/jpeg', 0.85));
+        canvas.width = canvas.height = 0;
+        const out = new Uint8Array(await blob.arrayBuffer());
+        image = asPng ? await doc.embedPng(out) : await doc.embedJpg(out);
+      }
+      const L = PB.layoutImage(w, h, opts.size);
+      const page = doc.addPage([L.pw, L.ph]);
+      page.drawImage(image, { x: L.x, y: L.y, width: L.w, height: L.h });
+      layouts.push({ page, L });
+    }
+
+    let words = 0;
+    if (opts.ocr) {
+      const fi = await PB.ocrFont(doc);
+      const sizes = [];
+      const jobs = items.map((it, i) => async () => {
+        const { canvas } = await loadItemCanvas(it, 3000);
+        sizes[i] = [canvas.width, canvas.height];
+        return canvas;
+      });
+      const results = await OCR.recognizeAll(jobs, {
+        lang: opts.lang,
+        signal,
+        onProgress: (done, total, frac) => prog.set(
+          `Reconhecendo texto… imagem ${Math.min(done + 1, total)} de ${total}`, share + frac * (0.95 - share), `${Math.round(frac * 100)}%`),
+      });
+      results.forEach((ws, i) => {
+        const { page, L } = layouts[i];
+        const [ow, oh] = sizes[i];
+        const pdfWords = PB.wordsToPdf(ws, (x, y) => [L.x + (x / ow) * L.w, L.y + L.h - (y / oh) * L.h], ow / L.w);
+        words += pdfWords.length;
+        PB.addInvisibleText(doc, page, fi, pdfWords);
+      });
+    }
+
+    prog.set('Gerando o arquivo…', 0.97, '');
+    const bytes = await doc.save({ useObjectStreams: false });
+    prog.close();
+    const name = items.length === 1
+      ? items[0].name.replace(/\.[^.]+$/, '') + '.pdf'
+      : `Digitalização ${new Date().toLocaleDateString('pt-BR').replaceAll('/', '-')}.pdf`;
+    await openBytes(bytes, name, dirname(items[0].path));
+    const pages = items.length === 1 ? '1 página' : `${items.length} páginas`;
+    toast(opts.ocr
+      ? `PDF criado com ${pages} e ${words} palavras reconhecidas. Salve com Ctrl+S.`
+      : `PDF criado com ${pages}. Salve com Ctrl+S.`, 7000);
+  } catch (err) {
+    prog.close();
+    if (err?.name === 'OcrCancelled' || signal.cancelled) { toast('Criação do PDF cancelada.'); return; }
+    console.error(err);
+    toast('Não foi possível criar o PDF: ' + (err?.message || err), 8000);
+  }
+}
+
 // ---------------------------------------------------------------- Impressão
 async function printDoc() {
   const d = state.active;
@@ -2075,7 +2585,7 @@ async function printDoc() {
       const canvas = document.createElement('canvas');
       canvas.width = Math.floor(vp.width);
       canvas.height = Math.floor(vp.height);
-      const ctx = canvas.getContext('2d', { alpha: false });
+      const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
       ctx.fillStyle = '#fff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       await page.render({ canvasContext: ctx, viewport: vp, intent: 'print', annotationMode: WITH_STORAGE }).promise;
@@ -2154,6 +2664,11 @@ api.onFullscreen((on) => {
 $('#btnOpen').addEventListener('click', openDialog);
 $('#btnNewTab').addEventListener('click', openDialog);
 $('#homeOpen').addEventListener('click', openDialog);
+$('#homeImages').addEventListener('click', async () => {
+  const files = await api.openDialog('images');
+  if (files.length) showImagesDialog(files);
+});
+$('#btnOcr').addEventListener('click', () => state.active && showOcrDialog(state.active));
 $('#btnSave').addEventListener('click', () => state.active?.save());
 $('#btnSidebar').addEventListener('click', () => setSidebar(!store.sidebar));
 $('#btnPrev').addEventListener('click', () => state.active?.goToPage(state.active.currentPage - 1));
@@ -2230,9 +2745,9 @@ document.addEventListener('drop', (e) => {
   e.preventDefault();
   dragDepth = 0;
   $('#dropOverlay').hidden = true;
-  const paths = [...e.dataTransfer.files].map((f) => api.pathForFile(f)).filter((p) => p && /\.pdf$/i.test(p));
+  const paths = [...e.dataTransfer.files].map((f) => api.pathForFile(f)).filter((p) => p && (/\.pdf$/i.test(p) || IMG_RE.test(p)));
   if (paths.length) openPaths(paths);
-  else if (e.dataTransfer.files.length) toast('Apenas arquivos PDF podem ser abertos.');
+  else if (e.dataTransfer.files.length) toast('Apenas PDFs e imagens (JPG, PNG, WebP, BMP, GIF) podem ser abertos.');
 });
 
 // Teclado
@@ -2267,7 +2782,8 @@ document.addEventListener('keydown', (e) => {
     // nos campos de texto, deixa os atalhos de edição nativos funcionarem
     if (inField && ['a', 'c', 'x', 'v', 'z', 'y'].includes(key)) return;
     let handled = true;
-    if (key === 'o') openDialog();
+    if (key === 'o' && e.shiftKey) { if (d) showOcrDialog(d); }
+    else if (key === 'o') openDialog();
     else if (key === 's' && d) d.save(e.shiftKey);
     else if (key === 'w') requestCloseDoc(d);
     else if (key === 'tab') cycleTab(e.shiftKey ? -1 : 1);

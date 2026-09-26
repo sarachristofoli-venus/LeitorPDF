@@ -1,6 +1,6 @@
 {
   "name": "leitor-pdf",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
@@ -9,10 +9,13 @@
   },
   "author": "Sara Christofoli",
   "license": "MIT",
-  "description": "Leitor de PDF leve, rápido e sem distrações",
+  "description": "Leitor de PDF com anotações, OCR e criação de PDF a partir de imagens",
   "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
+    "@tesseract.js-data/por": "^1.0.0",
     "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "^4.10.38"
+    "pdfjs-dist": "^4.10.38",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "electron": "^33.4.11",
@@ -39,7 +42,23 @@
       "!node_modules/pdfjs-dist/build/pdf.mjs",
       "!node_modules/pdfjs-dist/build/pdf.worker.mjs",
       "!node_modules/pdfjs-dist/build/pdf.sandbox*",
-      "!node_modules/@napi-rs/**"
+      "!node_modules/@napi-rs/**",
+      "!node_modules/tesseract.js/src/**",
+      "!node_modules/tesseract.js/docs/**",
+      "!node_modules/tesseract.js/examples/**",
+      "!node_modules/tesseract.js/scripts/**",
+      "!node_modules/tesseract.js/dist/tesseract.min.js",
+      "!node_modules/tesseract.js-core/*.wasm",
+      "!node_modules/tesseract.js-core/tesseract-core.wasm.js",
+      "!node_modules/tesseract.js-core/tesseract-core-simd.wasm.js",
+      "!node_modules/tesseract.js-core/tesseract-core-relaxedsimd.wasm.js",
+      "!node_modules/tesseract.js-core/tesseract-core.js",
+      "!node_modules/tesseract.js-core/tesseract-core-simd.js",
+      "!node_modules/tesseract.js-core/tesseract-core-relaxedsimd.js",
+      "!node_modules/tesseract.js-core/tesseract-core-lstm.js",
+      "!node_modules/tesseract.js-core/tesseract-core-simd-lstm.js",
+      "!node_modules/tesseract.js-core/tesseract-core-relaxedsimd-lstm.js",
+      "!node_modules/@tesseract.js-data/*/4.0.0/**"
     ],
     "win": {
       "target": [

@@ -446,3 +446,67 @@ svg.annotOutline rect { fill: none; stroke: var(--accent); stroke-width: 1.5; st
 
 .help-group { margin: 14px 0 4px; font-size: 13px; color: var(--accent); }
 .help-group:first-of-type { margin-top: 0; }
+
+/* ---------- Botões secundários e formulários ---------- */
+button.secondary {
+  display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface-2); color: var(--text); padding: 9px 16px; font-weight: 500; cursor: pointer;
+}
+button.secondary:hover { background: var(--hover); }
+button.small { padding: 5px 10px; font-size: 12.5px; }
+button.small svg { width: 15px; height: 15px; }
+button.primary:disabled { opacity: .45; cursor: default; filter: none; }
+.home-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.small { font-size: 12px; }
+.form { display: flex; flex-direction: column; gap: 8px; }
+.form p { margin: 0 0 4px; }
+.form-row { display: flex; align-items: center; gap: 10px; }
+.form-row > span { min-width: 130px; color: var(--muted); }
+.form-label { color: var(--muted); margin-top: 4px; }
+.check-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.check-row input { margin: 0; accent-color: var(--accent); }
+select.field {
+  height: 30px; padding: 0 8px; min-width: 200px; background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+select.field:disabled { opacity: .5; }
+
+/* ---------- Aviso de PDF digitalizado ---------- */
+.scan-banner {
+  position: sticky; top: 8px; z-index: 6; margin: 8px auto 0; width: fit-content; max-width: calc(100% - 32px);
+  display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow);
+}
+.scan-banner > svg { color: var(--accent); }
+.scan-banner button.primary.small { padding: 6px 12px; }
+
+/* ---------- Progresso ---------- */
+.progress-body p { margin: 0 0 10px; }
+.pbar { height: 8px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; }
+.pbar-fill { height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+.progress-body .small { margin: 8px 0 0; min-height: 1.4em; }
+
+/* ---------- Diálogo: imagens → PDF ---------- */
+#modal.wide { width: min(900px, calc(100vw - 32px)); }
+.img-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.img-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px;
+  max-height: 46vh; overflow: auto; padding: 4px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px;
+}
+.img-grid .empty { grid-column: 1 / -1; }
+.img-card {
+  position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 6px;
+  display: flex; flex-direction: column; gap: 4px; cursor: grab; user-select: none;
+}
+.img-card.dragging { opacity: .4; }
+.img-card.drop-target { outline: 2px dashed var(--accent); outline-offset: 2px; }
+.img-box { height: 130px; display: grid; place-items: center; overflow: hidden; background: #fff; border-radius: 4px; }
+.img-box img { max-width: 100%; max-height: 100%; object-fit: contain; transition: transform .15s; }
+.img-num {
+  position: absolute; top: 10px; left: 10px; min-width: 22px; height: 22px; padding: 0 6px; border-radius: 11px;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 600; display: grid; place-items: center;
+}
+.img-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.img-acts { display: flex; justify-content: center; gap: 2px; }
+.img-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 20px; margin-top: 10px; }
+.img-dlg > p.small { margin: 6px 2px 0; }
