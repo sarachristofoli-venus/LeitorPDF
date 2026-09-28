@@ -1,5 +1,7 @@
 // Montagem de PDFs: camada de texto invisível (OCR) e conversão de imagens em páginas.
-import { PDFDocument, PDFName, StandardFonts } from '../node_modules/pdf-lib/dist/pdf-lib.esm.min.js';
+import {
+  PDFDocument, PDFName, PDFArray, PDFDict, PDFRawStream, StandardFonts, decodePDFRawStream,
+} from '../node_modules/pdf-lib/dist/pdf-lib.esm.min.js';
 
 export { PDFDocument };
 
@@ -17,11 +19,15 @@ export const PAGE_SIZES = {
 export async function ocrFont(doc) {
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const charset = new Set(font.getCharacterSet());
+  const encodable = (str) => [...str].every((c) => charset.has(c.codePointAt(0)));
+  // Mantém tudo o que a fonte codifica (º ª ² ³ ½ …) e só decompõe o resto: ligaduras (ﬁ → fi) ou,
+  // em último caso, a letra sem acento. Normalizar tudo com NFKC trocaria "nº" por "no" e "m²" por "m2".
   const clean = (s) => {
     let out = '';
-    for (const ch of s.normalize('NFKC')) {
-      const cp = ch.codePointAt(0);
-      if (charset.has(cp)) { out += ch; continue; }
+    for (const ch of s.normalize('NFC')) {
+      if (charset.has(ch.codePointAt(0))) { out += ch; continue; }
+      const k = ch.normalize('NFKC');
+      if (k !== ch && encodable(k)) { out += k; continue; }
       const base = ch.normalize('NFD').charAt(0);
       if (charset.has(base.codePointAt(0))) out += base;
     }
@@ -85,6 +91,86 @@ export function addInvisibleText(doc, page, { font, clean }, words) {
   if (!page.node.wrapContentStreams(start, end)) page.node.set(PDFName.of('Contents'), doc.context.obj([start, end]));
 }
 
+/** /Contents da página, resolvido: PDFArray, fluxo único ou undefined. */
+function contentsOf(doc, page) {
+  const raw = page.node.get(PDFName.of('Contents'));
+  return raw ? doc.context.lookup(raw) : undefined;
+}
+
+/** Texto decodificado de um fluxo de conteúdo (null se não for um fluxo legível). */
+function streamText(obj) {
+  if (!(obj instanceof PDFRawStream)) return null;
+  try {
+    return new TextDecoder('latin1').decode(decodePDFRawStream(obj).decode());
+  } catch {
+    return null;
+  }
+}
+
+const isOwnOcrLayer = (t) => !!t && t.startsWith('Q\nBT\n3 Tr\n') && t.includes('/LpOcr');
+
+/**
+ * A página já tem texto invisível (modo 3) gravado por OUTRO programa — scanner, Adobe, OCRmyPDF…?
+ * Procura "3 Tr" nos fluxos de conteúdo da página e nos formulários (Form XObjects) que ela usa,
+ * ignorando a camada do próprio Leitor PDF.
+ */
+export function hasForeignInvisibleText(doc, page) {
+  const streams = [];
+  const contents = contentsOf(doc, page);
+  if (contents instanceof PDFArray) for (let i = 0; i < contents.size(); i++) streams.push(contents.lookup(i));
+  else if (contents) streams.push(contents);
+  const xobjects = page.node.Resources()?.lookupMaybe(PDFName.of('XObject'), PDFDict);
+  for (const key of xobjects?.keys() || []) {
+    const x = xobjects.lookup(key);
+    if (x instanceof PDFRawStream && x.dict.get(PDFName.of('Subtype')) === PDFName.of('Form')) streams.push(x);
+  }
+  for (const s of streams) {
+    const t = streamText(s);
+    if (!t || isOwnOcrLayer(t)) continue;
+    if (/(^|[\s\]])3\s+Tr\b/.test(t)) return true;
+  }
+  return false;
+}
+
+/**
+ * Remove a camada de texto invisível que o próprio Leitor PDF gravou num OCR anterior (fluxo que começa
+ * com "Q BT 3 Tr" e usa a fonte LpOcr), para que refazer o OCR substitua o texto em vez de duplicá-lo.
+ * @returns {boolean} true se havia uma camada anterior
+ */
+export function removeOcrLayer(doc, page) {
+  // /Contents pode ser um fluxo único ou um array de fluxos. A camada do app é sempre gravada como
+  // array (q … Q + texto), então um fluxo único nunca contém uma camada nossa.
+  const contents = contentsOf(doc, page);
+  if (!(contents instanceof PDFArray)) return false;
+  const text = (i) => streamText(contents.lookup(i));
+  let removed = 0;
+  for (let i = contents.size() - 1; i >= 0; i--) {
+    const t = text(i);
+    if (isOwnOcrLayer(t)) {
+      contents.remove(i);
+      removed++;
+    }
+  }
+  // cada camada foi gravada entre um fluxo "q" no início e o seu "Q": remove os "q" correspondentes
+  for (let k = 0; k < removed && contents.size() > 0; k++) {
+    if (text(0)?.trim() === 'q') contents.remove(0);
+  }
+  if (removed) {
+    const fonts = page.node.Resources()?.lookupMaybe(PDFName.of('Font'), PDFDict);
+    for (const key of fonts?.keys() || []) if (key.asString().startsWith('/LpOcr')) fonts.delete(key);
+  }
+  return removed > 0;
+}
+
+/**
+ * Tamanho (lado maior, em pixels) da imagem entregue ao OCR. O Tesseract erra com letras pequenas:
+ * imagens de até ~1900 px são ampliadas 2× (numa página de jornal, a citação em cinza claro só foi
+ * reconhecida assim); o limite de 4000 px evita lentidão com fotos grandes.
+ */
+export function ocrLongSide(longSide) {
+  return Math.round(Math.min(4000, Math.max(longSide, Math.min(2 * longSide, 3800))));
+}
+
 /**
  * Converte palavras do OCR (pixels de uma imagem) para coordenadas do PDF.
  * @param toPdf (px, py) → [x, y] no espaço do PDF
@@ -93,8 +179,8 @@ export function addInvisibleText(doc, page, { font, clean }, words) {
 export function wordsToPdf(words, toPdf, scale) {
   const out = [];
   for (const w of words) {
-    const [x0, y0] = toPdf(w.x0, w.by0);
-    const [x1, y1] = toPdf(w.x1, w.by1);
+    const [x0, y0] = toPdf(w.bx0, w.by0);
+    const [x1, y1] = toPdf(w.bx1, w.by1);
     const dx = x1 - x0, dy = y1 - y0;
     const len = Math.hypot(dx, dy);
     if (len < 0.5) continue;

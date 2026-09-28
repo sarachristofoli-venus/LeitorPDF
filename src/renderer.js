@@ -2238,7 +2238,7 @@ async function showOcrDialog(d) {
   };
   body.append(
     radio('missing', 'Somente páginas sem texto (recomendado)', true),
-    radio('all', 'Todas as páginas', false),
+    radio('all', 'Todas as páginas (refaz o OCR; o texto reconhecido antes é substituído)', false),
   );
   const v = await showModal('Reconhecer texto (OCR)', body, [
     { label: 'Cancelar', value: null },
@@ -2252,6 +2252,33 @@ async function showOcrDialog(d) {
 
 async function ocrDocument(d, { lang, mode }) {
   const [OCR, PB] = await Promise.all([import('./ocr.js'), import('./pdfbuild.js')]);
+
+  // Preparação (antes da barra de progresso: um diálogo aberto por cima dela contaria como "Cancelar").
+  // O PDF é alterado com o pdf-lib. Se ele não conseguir abrir o arquivo (protegido) ou se, ao refazer o
+  // OCR, houver texto invisível de OUTRO programa (que não dá para remover com segurança), é criada uma
+  // cópia nova a partir das imagens das páginas — o texto invisível antigo não entra na imagem.
+  const original = d.bytes || (await api.readFile(d.path));
+  let target = null;
+  try { target = await PB.PDFDocument.load(original, { updateMetadata: false }); } catch { target = null; }
+  let reason = target ? null : 'protegido';
+  if (target && mode === 'all') {
+    const foreign = d.pages.filter((p) => {
+      try { return PB.hasForeignInvisibleText(target, target.getPage(p.num - 1)); } catch { return false; }
+    }).length;
+    if (foreign) {
+      const v = await showModal('Texto reconhecido por outro programa', el('p', null,
+        `${foreign === 1 ? 'Uma página já tem' : `${foreign} páginas já têm`} texto invisível gravado por outro programa ` +
+        '(scanner, Adobe…). Para substituí-lo sem duplicar o texto, o Leitor PDF vai criar uma cópia nova do ' +
+        'documento a partir das imagens das páginas, com o novo texto reconhecido. O arquivo original não é alterado.'), [
+        { label: 'Cancelar', value: null },
+        { label: 'Criar cópia com novo OCR', value: 'ok', primary: true },
+      ]);
+      if (v !== 'ok') return;
+      reason = 'outro-ocr';
+    }
+  }
+  const rasterize = !!reason;
+
   const signal = { cancelled: false };
   const prog = progressModal('Reconhecendo texto', () => { signal.cancelled = true; signal.terminate?.(); });
   try {
@@ -2260,7 +2287,7 @@ async function ocrDocument(d, { lang, mode }) {
     const need = [];
     for (const n of all) {
       if (signal.cancelled) throw new OCR.OcrCancelled();
-      if (mode === 'all') { need.push(n); continue; }
+      if (mode === 'all' || rasterize) { need.push(n); continue; }
       const tc = await d.getText(n).catch(() => null);
       if (!tc || tc.text.replace(/\s+/g, '').length < 3) need.push(n);
     }
@@ -2269,11 +2296,6 @@ async function ocrDocument(d, { lang, mode }) {
       toast('Todas as páginas já têm texto selecionável. Para refazer o OCR, escolha “Todas as páginas”.', 6000);
       return;
     }
-    // Se o PDF não puder ser alterado (protegido), cria uma cópia com as páginas como imagens + texto
-    const original = d.bytes || (await api.readFile(d.path));
-    let target = null;
-    try { target = await PB.PDFDocument.load(original, { updateMetadata: false }); } catch { target = null; }
-    const rasterize = !target;
     const pages = rasterize ? all : need;
 
     const views = new Map();
@@ -2281,7 +2303,7 @@ async function ocrDocument(d, { lang, mode }) {
     const jobs = pages.map((n) => async () => {
       const page = await d.pdf.getPage(n);
       const base = page.getViewport({ scale: 1 });
-      const s = clamp(3000 / Math.max(base.width, base.height), 2, 300 / 72); // ~300 DPI
+      const s = clamp(3800 / Math.max(base.width, base.height), 2, 300 / 72); // até ~300 DPI
       const vp = page.getViewport({ scale: s });
       const canvas = document.createElement('canvas');
       canvas.width = Math.floor(vp.width);
@@ -2312,9 +2334,13 @@ async function ocrDocument(d, { lang, mode }) {
       const fi = await PB.ocrFont(target);
       pages.forEach((n, i) => {
         const vp = views.get(n);
-        const w = PB.wordsToPdf(results[i], (x, y) => vp.convertToPdfPoint(x, y), vp.scale);
+        // pixels por unidade do PDF, incluindo /UserUnit (vp.scale não o inclui; a transformação sim)
+        const pxPerUnit = Math.hypot(vp.transform[0], vp.transform[1]);
+        const w = PB.wordsToPdf(results[i], (x, y) => vp.convertToPdfPoint(x, y), pxPerUnit);
         words += w.length;
-        PB.addInvisibleText(target, target.getPage(n - 1), fi, w);
+        const page = target.getPage(n - 1);
+        PB.removeOcrLayer(target, page); // se o Leitor PDF já fez OCR nesta página, substitui em vez de duplicar
+        PB.addInvisibleText(target, page, fi, w);
       });
       const bytes = await target.save({ useObjectStreams: false });
       prog.close();
@@ -2336,7 +2362,9 @@ async function ocrDocument(d, { lang, mode }) {
       const bytes = await out.save({ useObjectStreams: false });
       prog.close();
       await openBytes(bytes, d.name.replace(/\.pdf$/i, '') + ' (OCR).pdf', d.dir);
-      toast('Este PDF é protegido contra alterações, então foi criada uma cópia com o texto reconhecido. Salve-a com Ctrl+S.', 8000);
+      toast(reason === 'protegido'
+        ? 'Este PDF é protegido contra alterações, então foi criada uma cópia com o texto reconhecido. Salve-a com Ctrl+S.'
+        : 'Foi criada uma cópia com o novo texto reconhecido (sem o texto antigo). Salve-a com Ctrl+S.', 8000);
     }
   } catch (err) {
     prog.close();
@@ -2349,13 +2377,17 @@ async function ocrDocument(d, { lang, mode }) {
 // ---------------------------------------------------------------- Imagens → PDF
 let imgDlg = null;
 
-/** Desenha a imagem já na orientação correta (EXIF + giro escolhido), limitada a maxSide pixels. */
-async function loadItemCanvas(it, maxSide) {
+/**
+ * Desenha a imagem já na orientação correta (EXIF + giro escolhido).
+ * @param size número = lado maior máximo (só reduz); função = lado maior desejado (pode ampliar, para o OCR)
+ */
+async function loadItemCanvas(it, size) {
   const bmp = await createImageBitmap(new Blob([it.bytes]), { imageOrientation: 'from-image' });
   const rot = it.rotation;
   const w = rot % 180 ? bmp.height : bmp.width;
   const h = rot % 180 ? bmp.width : bmp.height;
-  const k = Math.min(1, maxSide / Math.max(w, h));
+  const long = Math.max(w, h);
+  const k = typeof size === 'function' ? size(long) / long : Math.min(1, size / long);
   const cw = Math.max(1, Math.round(w * k)), ch = Math.max(1, Math.round(h * k));
   const c = document.createElement('canvas');
   c.width = cw;
@@ -2363,6 +2395,7 @@ async function loadItemCanvas(it, maxSide) {
   const ctx = c.getContext('2d', { alpha: false, willReadFrequently: true });
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, cw, ch);
+  ctx.imageSmoothingQuality = 'high';
   ctx.translate(cw / 2, ch / 2);
   ctx.rotate((rot * Math.PI) / 180);
   const dw = rot % 180 ? ch : cw, dh = rot % 180 ? cw : ch;
@@ -2525,7 +2558,7 @@ async function createPdfFromImages(items, opts) {
       const fi = await PB.ocrFont(doc);
       const sizes = [];
       const jobs = items.map((it, i) => async () => {
-        const { canvas } = await loadItemCanvas(it, 3000);
+        const { canvas } = await loadItemCanvas(it, PB.ocrLongSide);
         sizes[i] = [canvas.width, canvas.height];
         return canvas;
       });

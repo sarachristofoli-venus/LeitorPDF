@@ -6,7 +6,8 @@ import path from 'node:path';
 const [out, ...pdfs] = process.argv.slice(2);
 fs.mkdirSync(out, { recursive: true });
 const electron = process.env.LEITOR_EXE || path.resolve('node_modules/electron/dist/electron.exe');
-const proc = spawn(electron, [...(process.env.LEITOR_EXE ? [] : ['.']), '--remote-debugging-port=9333', `--user-data-dir=${path.join(out, 'profile')}`, ...pdfs], { stdio: 'inherit' });
+// janelas de teste encobertas por outras não podem ter o desenho pausado pelo Chromium
+const proc = spawn(electron, [...(process.env.LEITOR_EXE ? [] : ['.']), '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding', '--remote-debugging-port=9333', `--user-data-dir=${path.join(out, 'profile')}`, ...pdfs], { stdio: 'inherit' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let target;
 for (let i = 0; i < 60 && !target; i++) {

@@ -4,7 +4,7 @@ Leitor de PDF para Windows, leve e sem distrações. Usa Electron com o PDF.js, 
 
 ## Instalar
 
-Execute `dist/LeitorPDF-Setup-1.2.0.exe`. O instalador:
+Execute `dist/LeitorPDF-Setup-1.2.1.exe`. O instalador:
 - deixa escolher a pasta de instalação e não exige administrador;
 - cria atalhos na Área de Trabalho e no Menu Iniciar;
 - registra o app para arquivos `.pdf`. Para torná-lo o padrão, clique com o botão direito em um PDF, escolha **Abrir com → Escolher outro aplicativo → Leitor PDF** e marque **Sempre**.
@@ -53,6 +53,12 @@ Pressione **F1** no app para ver todos os atalhos de teclado.
 - **Imagens:** arraste várias fotos (JPG, PNG, WebP, BMP, GIF) para a janela ou use *Criar PDF a partir de imagens*.
   A orientação das fotos de celular é corrigida automaticamente; as páginas podem ser reordenadas e giradas.
 - PDFs protegidos contra alteração recebem uma **cópia** com o texto reconhecido (o original não é modificado).
+- **Layout em colunas** (jornais, revistas): o Tesseract roda em modo de segmentação automática (PSM 3), que
+  separa colunas, títulos, legendas e fotos. Assim, selecionar uma coluna copia só aquela coluna.
+- **Fotos tortas / digitalizações enviesadas**: a inclinação é medida e corrigida antes da leitura; o texto
+  invisível é posicionado de volta sobre a imagem original.
+- **Letras pequenas**: imagens de até ~1900 px são ampliadas 2× antes do OCR.
+- **Refazer o OCR**: escolha *Todas as páginas*; a camada de texto anterior é substituída, sem duplicar.
 
 ### Aceleração por GPU
 Vem **desligada** por padrão: o PDF.js já desenha as páginas na CPU, e em alguns drivers a GPU travava por
