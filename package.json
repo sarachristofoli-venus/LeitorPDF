@@ -1,6 +1,6 @@
 {
   "name": "leitor-pdf",
-  "version": "1.2.1",
+  "version": "1.4.0",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
@@ -58,7 +58,13 @@
       "!node_modules/tesseract.js-core/tesseract-core-lstm.js",
       "!node_modules/tesseract.js-core/tesseract-core-simd-lstm.js",
       "!node_modules/tesseract.js-core/tesseract-core-relaxedsimd-lstm.js",
-      "!node_modules/@tesseract.js-data/*/4.0.0/**"
+      "!node_modules/@tesseract.js-data/*/4.0.0/**",
+    "!node_modules/pdf-lib/cjs/**",
+    "!node_modules/pdf-lib/es/**",
+    "!node_modules/pdf-lib/src/**",
+    "!node_modules/pdf-lib/ts3.4/**",
+    "!node_modules/pdf-lib/dist/pdf-lib.js",
+    "!node_modules/pdf-lib/dist/pdf-lib.esm.js"
     ],
     "win": {
       "target": [

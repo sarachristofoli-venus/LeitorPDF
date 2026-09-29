@@ -1,9 +1,13 @@
 // Montagem de PDFs: camada de texto invisível (OCR) e conversão de imagens em páginas.
 import {
-  PDFDocument, PDFName, PDFArray, PDFDict, PDFRawStream, StandardFonts, decodePDFRawStream,
+  PDFDocument, PDFName, PDFArray, PDFDict, PDFRawStream, StandardFonts, decodePDFRawStream, ParseSpeeds,
 } from '../node_modules/pdf-lib/dist/pdf-lib.esm.min.js';
 
 export { PDFDocument };
+
+// Sem as pausas que o pdf-lib faz por padrão a cada 50–100 objetos (lentas em PDFs grandes).
+export const loadPdf = (bytes) => PDFDocument.load(bytes, { updateMetadata: false, parseSpeed: ParseSpeeds.Fastest });
+export const savePdf = (doc) => doc.save({ useObjectStreams: false, objectsPerTick: Infinity });
 
 const f = (n) => (Math.round(n * 1000) / 1000).toString();
 

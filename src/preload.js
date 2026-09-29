@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('leitor', {
   copyText: (text) => ipcRenderer.send('copy-text', text),
   closeWindow: () => ipcRenderer.send('close-window'),
   saveDialog: (defaultPath) => ipcRenderer.invoke('save-dialog', defaultPath),
+  saveFile: (defaultPath, bytes, ext) => ipcRenderer.invoke('save-file', defaultPath, bytes, ext),
+  copyImage: (bytes) => ipcRenderer.invoke('copy-image', bytes),
   saveAnnotations: (job) => ipcRenderer.invoke('save-annotations', job),
   sidecarGet: (file) => ipcRenderer.invoke('sidecar-get', file),
   sidecarSet: (file, data) => ipcRenderer.invoke('sidecar-set', file, data),

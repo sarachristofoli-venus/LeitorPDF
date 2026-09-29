@@ -1,6 +1,7 @@
 import * as pdfjsLib from '../node_modules/pdfjs-dist/build/pdf.min.mjs';
 import { registerTextLayer, unregisterTextLayer, cleanText, selectionInTextLayer } from './selection.js';
 import * as A from './annotations.js';
+import { NewsEditor } from './editor.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../node_modules/pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).href;
 const CMAP_URL = new URL('../node_modules/pdfjs-dist/cmaps/', import.meta.url).href;
@@ -12,7 +13,9 @@ const ZOOM_STEPS = [0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.
 const MIN_ZOOM = 0.1, MAX_ZOOM = 8;
 const THUMB_W = 150;
 const MAX_CANVAS_PIXELS = 16777216;
+const PAGE_CACHE = 12; // páginas que guardam o conteúdo já preparado (imagens decodificadas) para voltar rápido
 const WITH_STORAGE = pdfjsLib.AnnotationMode.ENABLE_STORAGE;
+const PDF_OPTIONS = { cMapUrl: CMAP_URL, cMapPacked: true, standardFontDataUrl: FONT_URL, isEvalSupported: false };
 
 const $ = (s) => document.querySelector(s);
 const el = (tag, cls, text) => {
@@ -83,18 +86,22 @@ function foldChar(c, matchCase) {
   }
   return r;
 }
+const NON_ASCII = /[^\x00-\x7f]/g;
 function fold(s, matchCase) {
-  let out = '';
-  for (let i = 0; i < s.length; i++) out += foldChar(s[i], matchCase);
-  return out;
+  // só os caracteres não ASCII passam pela tabela; depois dela todos já estão em minúsculas estáveis,
+  // então o toLowerCase só mexe no ASCII e o texto continua com o mesmo comprimento
+  const t = s.replace(NON_ASCII, (c) => foldChar(c, matchCase));
+  return matchCase ? t : t.toLowerCase();
 }
 
 // ---------------------------------------------------------------- Estado global
 const state = { docs: [], active: null, presentation: false, fullscreen: false, tool: 'select', author: '' };
 
 // ================================================================= Documento
+let docSeq = 0;
 class Doc {
   constructor(path, { bytes = null, name = null, dir = null } = {}) {
+    this.uid = ++docSeq;
     this.path = path;
     this.name = name || basename(path);
     this.dir = dir || (path ? dirname(path) : null);
@@ -109,7 +116,9 @@ class Doc {
     this.rotation = 0;
     this.currentPage = 1;
     this.visible = new Set();
+    this.recentPages = []; // páginas preparadas pelo PDF.js, da mais antiga para a mais recente
     this.textCache = new Map();
+    this.textPending = new Map(); // leituras de texto em andamento (evita pedir a mesma página duas vezes)
     this.search = null;
     this.searchToken = 0;
     this.closed = false;
@@ -171,15 +180,19 @@ class Doc {
         if (!e.target.closest('.linkLayer a')) this.goToPage(this.currentPage + 1);
         return;
       }
-      if (e.target.closest('.note-icon, .linkLayer a')) return;
+      if (e.target.closest('.note-icon, .linkLayer a, .edMark')) return;
       const p = e.target.closest('.page')?._p;
       if (!p) return;
+      if (editor.active && state.tool === 'select' && !this.panMoved && document.getSelection().isCollapsed && editor.click(this, p, e)) return;
       if (state.tool === 'note') { this.placeNote(p, e.clientX, e.clientY); return; }
       if (this.panMoved) return;
       if (!document.getSelection().isCollapsed) return;
       const id = this.hitTest(p, e.clientX, e.clientY);
       if (id) openPopover(this, id);
     });
+
+    // clique duplo/triplo (selecionar palavra/linha): o bloco agendado pelo 1º clique não entra
+    v.addEventListener('mousedown', (e) => { if (e.detail > 1) editor.cancelClick(); });
 
     v.addEventListener('contextmenu', (e) => {
       e.preventDefault();
@@ -196,6 +209,7 @@ class Doc {
         const p = target.closest?.('.page')?._p;
         const hit = p && state.tool !== 'note' && document.getSelection().isCollapsed && this.hitTest(p, clientX, clientY);
         v.classList.toggle('over-annot', !!hit);
+        if (editor.active) editor.hover(this, state.tool === 'select' ? p : null, clientX, clientY);
       });
     });
 
@@ -230,18 +244,14 @@ class Doc {
 
   // ------------------------------------------------------------ Carregamento
   async load({ restore = null } = {}) {
-    const data = this.bytes ? this.bytes.slice() : await api.readFile(this.path);
+    let data;
+    if (this.bytes) data = this.bytes.slice();
+    else [data, this.stamp] = await Promise.all([api.readFile(this.path), api.fileStat(this.path)]);
     if (this.closed) return;
-    this.task = pdfjsLib.getDocument({
-      data,
-      cMapUrl: CMAP_URL,
-      cMapPacked: true,
-      standardFontDataUrl: FONT_URL,
-      isEvalSupported: false,
-    });
+    this.task = pdfjsLib.getDocument({ data, ...PDF_OPTIONS });
     this.task.onPassword = (update, reason) => {
       askPassword(this.name, reason === pdfjsLib.PasswordResponses.INCORRECT_PASSWORD).then((pw) => {
-        if (pw == null) { this.cancelled = true; this.task.destroy(); } else update(pw);
+        if (pw == null) { this.cancelled = true; this.task.destroy(); } else { this.password = pw; update(pw); }
       });
     };
     this.pdf = await this.task.promise;
@@ -251,6 +261,7 @@ class Doc {
     const t = meta?.info?.Title?.trim();
     if (t && !/^untitled|^microsoft word/i.test(t)) this.title = t;
     this.meta = meta;
+    this.labels = await this.pdf.getPageLabels().catch(() => null);
 
     // anotações guardadas pelo app (PDFs protegidos)
     const side = this.path && !restore ? await api.sidecarGet(this.path).catch(() => null) : null;
@@ -306,10 +317,15 @@ class Doc {
       p.renderTask?.cancel();
       if (p.textDiv) unregisterTextLayer(p.textDiv);
     }
+    for (const p of this.pages) editor.dropLayer(p);
+    editor.forgetDoc(this);
     this.pages = [];
+    this.releaseTextHelpers();
     this.docGen++; // invalida leituras ainda em andamento do conteúdo anterior
     this.visible.clear();
+    this.recentPages = [];
     this.textCache.clear();
+    this.textPending.clear();
     this.searchToken++;
     this.search = null;
     this.lastThumb = null;
@@ -371,6 +387,8 @@ class Doc {
     let changed = false;
     for (let i = 1; i <= this.pages.length; i++) {
       if (this.closed || gen !== this.docGen) return;
+      if (i % 8 === 0) await this.viewSettled();
+      if (this.closed || gen !== this.docGen) return;
       const p = this.pages[i - 1];
       try {
         const page = p.page || (p.page = await this.pdf.getPage(i));
@@ -388,6 +406,11 @@ class Doc {
         changed = false;
       }
     }
+  }
+
+  /** Rótulo impresso da página (ex.: "A3"), ou o número. */
+  pageLabel(n) {
+    return this.labels?.[n - 1] || String(n);
   }
 
   dims(p) {
@@ -593,7 +616,9 @@ class Doc {
     p.linkDiv?.remove(); p.linkDiv = null;
     p.svg?.remove(); p.outline?.remove(); p.noteLayer?.remove();
     p.svg = p.outline = p.noteLayer = null; p.geom = null;
+    editor.dropLayer(p);
     p.renderedKey = null;
+    p.pendingKey = null; // o desenho interrompido não conta como "em andamento" (senão a página voltava em branco)
     p.div.classList.add('loading');
   }
 
@@ -631,9 +656,13 @@ class Doc {
       p.wrap.prepend(canvas);
       p.div.classList.remove('loading');
       p.renderedKey = key;
+      this.keepPrepared(p);
       this.renderAnnotLayer(p);
       await this.renderTextLayer(p, page, viewport, gen);
-      if (gen === p.gen) this.renderLinks(p, viewport);
+      if (gen === p.gen) {
+        this.renderLinks(p, viewport);
+        if (editor.active) editor.renderLayer(this, p);
+      }
     } catch (err) {
       if (err?.name !== 'RenderingCancelledException' && err?.message !== 'Documento recarregado') console.error('Erro ao renderizar página', p.num, err);
     } finally {
@@ -641,30 +670,152 @@ class Doc {
     }
   }
 
-  async getText(num) {
-    let tc = this.textCache.get(num);
-    if (!tc) {
-      const gen = this.docGen;
-      const p = this.pages[num - 1];
-      if (!p || !this.pdf) throw new Error('Documento recarregado');
-      const page = p.page || (p.page = await this.pdf.getPage(num));
-      const content = await page.getTextContent();
-      // o documento foi recarregado (ex.: OCR) enquanto o texto era lido: descarta o resultado antigo
-      if (gen !== this.docGen) throw new Error('Documento recarregado');
-      const items = content.items.filter((it) => it.str !== undefined);
-      // Texto da página: um espaço virtual após cada fim de linha para a busca atravessar linhas
-      const offsets = [];
-      let text = '', lines = '';
-      for (const it of items) {
-        offsets.push(text.length);
-        text += it.str;
-        lines += it.str;
-        if (it.hasEOL) { text += ' '; lines += '\n'; }
-      }
-      tc = { content, items, offsets, text, lines, folded: {} };
-      this.textCache.set(num, tc);
+  /**
+   * O PDF.js guarda, por página, tudo o que preparou para desenhá-la (em PDFs digitalizados ou com fotos,
+   * as imagens já decodificadas: ~10 MB por página). Sem limite, a memória só crescia ao rolar o documento.
+   * Mantém as PAGE_CACHE páginas usadas por último (voltar a elas é instantâneo) e libera as outras.
+   */
+  keepPrepared(p) {
+    const list = this.recentPages;
+    const i = list.indexOf(p);
+    if (i !== -1) list.splice(i, 1);
+    list.push(p);
+    for (let k = 0; list.length > PAGE_CACHE && k < list.length - PAGE_CACHE;) {
+      const q = list[k];
+      if (this.visible.has(q) || q.pendingKey || q.thumbBusy) { k++; continue; }
+      q.page?.cleanup();
+      list.splice(k, 1);
     }
+  }
+
+  /** Resolve quando as páginas na tela terminam de desenhar (tarefas secundárias esperam a vez). */
+  viewSettled() {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.closed || ![...this.visible].some((p) => p.pendingKey)) resolve();
+        else setTimeout(check, 60);
+      };
+      check();
+    });
+  }
+
+  getText(num, source = null) {
+    const tc = this.textCache.get(num);
+    if (tc) return Promise.resolve(tc);
+    let pending = this.textPending.get(num);
+    if (!pending) {
+      pending = this.readText(num, source).finally(() => {
+        if (this.textPending.get(num) === pending) this.textPending.delete(num);
+      });
+      this.textPending.set(num, pending);
+    }
+    return pending;
+  }
+
+  async readText(num, source = null) {
+    const gen = this.docGen;
+    const p = this.pages[num - 1];
+    if (!p || !this.pdf) throw new Error('Documento recarregado');
+    const page = source ? await source.getPage(num) : p.page || (p.page = await this.pdf.getPage(num));
+    const content = await page.getTextContent();
+    if (source) page.cleanup();
+    // o documento foi recarregado (ex.: OCR) enquanto o texto era lido: descarta o resultado antigo
+    if (gen !== this.docGen) throw new Error('Documento recarregado');
+    const items = content.items.filter((it) => it.str !== undefined);
+    // Texto da página: um espaço virtual após cada fim de linha para a busca atravessar linhas
+    const offsets = [];
+    let text = '', lines = '';
+    for (const it of items) {
+      offsets.push(text.length);
+      text += it.str;
+      lines += it.str;
+      if (it.hasEOL) { text += ' '; lines += '\n'; }
+    }
+    const tc = { content, items, offsets, text, lines, folded: {} };
+    this.textCache.set(num, tc);
     return tc;
+  }
+
+  /**
+   * Lê o texto de todas as páginas pedindo várias de uma vez ao worker do PDF.js (uma por vez, ele ficava
+   * esperando a ida e volta de cada pedido). Chama visit(n, tc) na ordem das páginas; para se stop() for true.
+   */
+  async eachText(visit, stop, ahead = 8) {
+    const total = this.pages.length;
+    const helpers = this.textCache.size < total ? await this.textHelpers() : [];
+    if (helpers.length) { this.helperUsers = (this.helperUsers || 0) + 1; clearTimeout(this.helperTimer); }
+    const sources = [null, ...helpers];
+    ahead *= sources.length;
+    const queue = [];
+    const want = (n) => { if (n <= total) queue[n] = this.getText(n, sources[n % sources.length]).catch(() => null); };
+    try {
+      for (let n = 1; n <= Math.min(ahead, total); n++) want(n);
+      for (let n = 1; n <= total; n++) {
+        want(n + ahead);
+        const tc = await queue[n];
+        queue[n] = null;
+        if (stop()) return false;
+        if (tc) visit(n, tc);
+      }
+      return true;
+    } finally {
+      // Ninguém mais usando os leitores extras: com o texto todo lido, fecha na hora; senão, após 15 s parados.
+      if (helpers.length && --this.helperUsers === 0) {
+        if (this.textCache.size >= total) this.releaseTextHelpers();
+        else this.helperTimer = setTimeout(() => { if (!this.helperUsers) this.releaseTextHelpers(); }, 15000);
+      }
+    }
+  }
+
+  /**
+   * Leitores extras (outros workers do PDF.js com o mesmo arquivo) para ler o texto de documentos longos
+   * em paralelo: um worker sozinho leva ~8 ms por página, e a busca num livro de 600 páginas levava ~5 s.
+   * São criados na primeira busca e fechados quando todo o texto já foi lido (ou o documento fecha).
+   */
+  textHelpers() {
+    if (this.helpersPromise) return this.helpersPromise;
+    const cores = navigator.hardwareConcurrency || 2;
+    let k = Math.min(3, Math.floor((cores - 2) / 2));
+    if (k < 1 || this.pages.length < 60) return Promise.resolve([]);
+    const gen = this.docGen;
+    const tasks = [];
+    this.helperTasks = tasks;
+    this.helpersPromise = (async () => {
+      let data;
+      if (this.bytes) data = this.bytes;
+      else {
+        // relê o arquivo só se ele não mudou no disco desde que foi aberto
+        const st = await api.fileStat(this.path);
+        if (!st || !this.stamp || st.size !== this.stamp.size || st.mtime !== this.stamp.mtime) return [];
+        data = await api.readFile(this.path);
+      }
+      if (gen !== this.docGen || this.closed || data.length > 150e6) return [];
+      if (data.length > 50e6) k = 1; // cada leitor guarda uma cópia do arquivo
+      for (let i = 0; i < k; i++) {
+        const task = pdfjsLib.getDocument({ data: data.slice(), password: this.password, ...PDF_OPTIONS });
+        task.onPassword = () => task.destroy();
+        tasks.push(task);
+      }
+      const docs = await Promise.all(tasks.map((t) => t.promise.catch(() => null)));
+      return docs.filter((d) => d && d.numPages === this.pages.length);
+    })().catch(() => []);
+    return this.helpersPromise;
+  }
+
+  releaseTextHelpers() {
+    clearTimeout(this.helperTimer);
+    for (const t of this.helperTasks || []) t.destroy();
+    this.helperTasks = null;
+    this.helpersPromise = null;
+  }
+
+  /** Adianta a leitura do texto (ao abrir a barra de busca), para a busca terminar mais rápido. */
+  prefetchText() {
+    if (this.prefetching || !this.pdf || this.textCache.size >= this.pages.length) return;
+    this.prefetching = true;
+    const gen = this.docGen;
+    this.eachText(() => {}, () => this.closed || gen !== this.docGen, 3)
+      .finally(() => { this.prefetching = false; });
   }
 
   async renderTextLayer(p, page, viewport, gen) {
@@ -1050,6 +1201,7 @@ class Doc {
       }
       this.bytes = null;
       this.contentDirty = false;
+      this.stamp = await api.fileStat(dest);
       this.resetBaseline();
       if (state.active === this) updateUI();
       toast(saveAs ? `Salvo como “${this.name}”.` : hadContent ? 'Documento salvo.' : 'Anotações salvas no PDF.', 2500);
@@ -1222,9 +1374,12 @@ class Doc {
     if (p.thumbKey === this.rotation) return;
     p.thumbBusy = true;
     p.thumbAgain = false;
-    const rot = this.rotation;
+    let rot = this.rotation;
     let ok = false;
     try {
+      await this.viewSettled(); // as miniaturas não disputam o PDF.js com as páginas na tela
+      if (this.closed || !this.pdf) return;
+      rot = this.rotation;
       const page = p.page || (p.page = await this.pdf.getPage(p.num));
       await this.ensureAnnots(p);
       const base = this.viewportFor(page, 1);
@@ -1240,6 +1395,7 @@ class Doc {
       p.thumbFrame.append(canvas);
       p.thumbKey = rot;
       ok = true;
+      this.keepPrepared(p);
     } catch (err) {
       console.warn('Miniatura', p.num, err);
     } finally {
@@ -1308,10 +1464,7 @@ class Doc {
     const q = fold(query, matchCase);
     const startPage = this.currentPage;
     let lastUi = 0;
-    for (let n = 1; n <= this.pages.length; n++) {
-      let tc;
-      try { tc = await this.getText(n); } catch { continue; }
-      if (token !== this.searchToken || this.closed) return;
+    const finished = await this.eachText((n, tc) => {
       const key = matchCase ? 'c' : 'i';
       const hay = tc.folded[key] || (tc.folded[key] = fold(tc.text, matchCase));
       let i = hay.indexOf(q);
@@ -1328,7 +1481,8 @@ class Doc {
       const pg = this.pages[n - 1];
       if (pg.textLayer && this.search.byPage.has(n)) this.applyHighlights(pg);
       if (Date.now() - lastUi > 120) { updateSearchUI(); lastUi = Date.now(); }
-    }
+    }, () => token !== this.searchToken || this.closed);
+    if (!finished) return;
     this.search.done = true;
     if (this.search.current === -1 && this.search.matches.length) this.selectMatch(0);
     updateSearchUI();
@@ -1416,6 +1570,8 @@ class Doc {
     this.thumbsEl.remove();
     this.outlineEl.remove();
     this.annotListEl.remove();
+    editor.forgetDoc(this);
+    this.releaseTextHelpers();
     (this.pdf || this.task)?.destroy();
   }
 }
@@ -1727,6 +1883,34 @@ function buildSelBar() {
     el('span', 'sep'),
     btn('copy', 'Copiar (Ctrl+C)', () => { copySelection(false); document.getSelection().removeAllRanges(); hideSelBar(); }),
   );
+  if (editor.active) {
+    const send = el('button', 'sb-send', 'Enviar para ' + editor.fieldLabel());
+    send.title = 'Acrescentar o trecho selecionado ao campo ativo do editor';
+    send.addEventListener('click', () => sendSelectionToEditor());
+    selBar.append(el('span', 'sep'), send);
+  }
+}
+
+/** Trecho selecionado → campo ativo do editor de matérias (com a área marcada na página). */
+function sendSelectionToEditor() {
+  const d = state.active;
+  const sel = document.getSelection();
+  if (!d || !editor.active || sel.isCollapsed) return;
+  const byPage = new Map();
+  for (const r of sel.getRangeAt(0).getClientRects()) {
+    if (r.width < 1 || r.height < 1) continue;
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const p = d.pages.find((q) => { const b = q.div.getBoundingClientRect(); return cx >= b.left && cx <= b.right && cy >= b.top && cy <= b.bottom; });
+    if (!p?.page) continue;
+    // retângulos grandes (fim da camada de texto, seleção que "vaza") não são linhas de texto
+    const b = p.div.getBoundingClientRect();
+    if (r.height > b.height * 0.08 || r.width > b.width * 0.98) continue;
+    const cur = byPage.get(p);
+    byPage.set(p, cur ? { left: Math.min(cur.left, r.left), top: Math.min(cur.top, r.top), right: Math.max(cur.right, r.right), bottom: Math.max(cur.bottom, r.bottom) } : { left: r.left, top: r.top, right: r.right, bottom: r.bottom });
+  }
+  editor.addSelection(d, cleanText(sel.toString()), [...byPage]);
+  sel.removeAllRanges();
+  hideSelBar();
 }
 selBar.addEventListener('mousedown', (e) => e.preventDefault());
 
@@ -1952,6 +2136,7 @@ function openSearchBar() {
   input.focus();
   input.select();
   $('#btnSearch').classList.add('on');
+  state.active.prefetchText();
 }
 
 function closeSearchBar() {
@@ -2123,6 +2308,7 @@ function showHelp() {
     ['Seleção e anotações', [
       ['V', 'Ferramenta de seleção de texto'], ['H', 'Ferramenta Mão (arrastar a página)'],
       ['M', 'Ferramenta Marca-texto'], ['N', 'Ferramenta Nota'],
+      ['E', 'Editor de matéria (clique nos blocos para montar a matéria)'], ['Esc (no editor)', 'Limpar a matéria e começar outra'],
       ['Clique duplo / triplo', 'Seleciona palavra / linha'], ['Ctrl+A', 'Seleciona o texto da página'],
       ['Ctrl+C', 'Copiar (corrige hifenização e ligaduras)'],
       ['Ctrl+Z / Ctrl+Y', 'Desfazer / refazer anotação'], ['Delete', 'Excluir a anotação aberta'],
@@ -2259,7 +2445,7 @@ async function ocrDocument(d, { lang, mode }) {
   // cópia nova a partir das imagens das páginas — o texto invisível antigo não entra na imagem.
   const original = d.bytes || (await api.readFile(d.path));
   let target = null;
-  try { target = await PB.PDFDocument.load(original, { updateMetadata: false }); } catch { target = null; }
+  try { target = await PB.loadPdf(original); } catch { target = null; }
   let reason = target ? null : 'protegido';
   if (target && mode === 'all') {
     const foreign = d.pages.filter((p) => {
@@ -2342,7 +2528,7 @@ async function ocrDocument(d, { lang, mode }) {
         PB.removeOcrLayer(target, page); // se o Leitor PDF já fez OCR nesta página, substitui em vez de duplicar
         PB.addInvisibleText(target, page, fi, w);
       });
-      const bytes = await target.save({ useObjectStreams: false });
+      const bytes = await PB.savePdf(target);
       prog.close();
       await d.reloadFromBytes(bytes);
       toast(`Texto reconhecido em ${pages.length} ${pages.length === 1 ? 'página' : 'páginas'} (${words} palavras). Salve com Ctrl+S para manter.`, 6000);
@@ -2359,7 +2545,7 @@ async function ocrDocument(d, { lang, mode }) {
         words += w.length;
         PB.addInvisibleText(out, page, fi, w);
       }
-      const bytes = await out.save({ useObjectStreams: false });
+      const bytes = await PB.savePdf(out);
       prog.close();
       await openBytes(bytes, d.name.replace(/\.pdf$/i, '') + ' (OCR).pdf', d.dir);
       toast(reason === 'protegido'
@@ -2578,7 +2764,7 @@ async function createPdfFromImages(items, opts) {
     }
 
     prog.set('Gerando o arquivo…', 0.97, '');
-    const bytes = await doc.save({ useObjectStreams: false });
+    const bytes = await PB.savePdf(doc);
     prog.close();
     const name = items.length === 1
       ? items[0].name.replace(/\.[^.]+$/, '') + '.pdf'
@@ -2745,6 +2931,8 @@ pageInput.addEventListener('keydown', (e) => {
     state.active?.goToPage(parseInt(pageInput.value, 10));
     state.active?.viewer.focus({ preventScroll: true });
   } else if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
     updatePageUI();
     state.active?.viewer.focus({ preventScroll: true });
   }
@@ -2759,7 +2947,7 @@ const searchInput = $('#searchInput');
 searchInput.addEventListener('input', triggerSearchDebounced);
 searchInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); searchStep(e.shiftKey ? -1 : 1); }
-  else if (e.key === 'Escape') { e.preventDefault(); closeSearchBar(); }
+  else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSearchBar(); }
 });
 $('#searchCase').addEventListener('change', triggerSearch);
 $('#searchNext').addEventListener('click', () => searchStep(1));
@@ -2851,10 +3039,12 @@ document.addEventListener('keydown', (e) => {
     if (!selBar.hidden) { document.getSelection().removeAllRanges(); hideSelBar(); }
     else if (state.tool !== 'select') setTool('select');
     else if (!$('#searchbar').hidden) closeSearchBar();
+    else if (editor.active && d && !inField && !e.defaultPrevented) editor.clear(true);
     else if (state.fullscreen) api.fullscreen(false);
     return;
   }
   if (inField || !d?.pdf) return;
+  if (!e.altKey && k.toLowerCase() === 'e' && !state.presentation) { e.preventDefault(); editor.toggle(); return; }
   const tools = { v: 'select', h: 'hand', m: 'highlight', n: 'note' };
   if (!e.altKey && tools[k.toLowerCase()]) { e.preventDefault(); setTool(tools[k.toLowerCase()]); return; }
   if (k === 'Home') { e.preventDefault(); d.goToPage(1); }
@@ -2918,6 +3108,16 @@ async function confirmQuit() {
   }
 }
 
+// ================================================================= Editor de matérias
+const editor = new NewsEditor({
+  $, el, icon, api, toast, pdfjsLib, store, saveStore,
+  withStorage: WITH_STORAGE,
+  getActive: () => state.active,
+  docs: () => state.docs,
+  relayout: () => positionPopover(),
+});
+$('#btnEditor').addEventListener('click', () => editor.toggle());
+
 // ================================================================= Inicialização
 applyTheme();
 setSidebar(store.sidebar);
@@ -2925,7 +3125,7 @@ setNight(store.night);
 setTool('select');
 updateMarkerColor();
 renderRecent();
-state.author = await api.userName().catch(() => '');
 api.onOpenFiles((files) => openPaths(files));
-const initial = await api.initialFiles();
+const [author, initial] = await Promise.all([api.userName().catch(() => ''), api.initialFiles()]);
+state.author = author;
 if (initial.length) openPaths(initial);

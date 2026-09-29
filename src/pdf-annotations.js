@@ -1,9 +1,15 @@
 'use strict';
 // Grava anotações (marca-texto, sublinhado, tachado e notas) dentro do PDF usando pdf-lib.
 const fs = require('fs');
+// versão empacotada num arquivo só: carrega em ~30 ms (a versão padrão, em centenas de arquivos, ~200 ms)
 const {
-  PDFDocument, PDFName, PDFString, PDFHexString, PDFArray, PDFDict, PDFRef, EncryptedPDFError,
-} = require('pdf-lib');
+  PDFDocument, PDFName, PDFString, PDFHexString, PDFArray, PDFDict, PDFRef, EncryptedPDFError, ParseSpeeds,
+} = require('pdf-lib/dist/pdf-lib.min.js');
+
+// Sem pausas no meio da leitura/gravação: por padrão o pdf-lib cede a vez a cada 50–100 objetos com
+// setTimeout, e no Windows cada pausa leva ~15 ms (um PDF com 8 mil objetos demorava 7,5 s para salvar; assim, 0,2 s).
+const LOAD = { updateMetadata: false, parseSpeed: ParseSpeeds.Fastest };
+const SAVE = { useObjectStreams: false, objectsPerTick: Infinity };
 
 const SUBTYPE = { highlight: 'Highlight', underline: 'Underline', strikeout: 'StrikeOut', note: 'Text' };
 
@@ -102,7 +108,7 @@ async function saveAnnotations(job) {
   const bytes = job.srcBytes ? job.srcBytes : await fs.promises.readFile(job.src);
   let doc;
   try {
-    doc = await PDFDocument.load(bytes, { updateMetadata: false });
+    doc = await PDFDocument.load(bytes, LOAD);
   } catch (err) {
     if (err instanceof EncryptedPDFError || /encrypt/i.test(err?.message)) return { error: 'encrypted' };
     throw err;
@@ -142,9 +148,9 @@ async function saveAnnotations(job) {
     refs[a.id] = refId(ref);
   }
 
-  const out = await doc.save({ useObjectStreams: false });
+  const out = await doc.save(SAVE);
   // Confere se o arquivo gerado abre e tem o mesmo número de páginas antes de substituir o original
-  const check = await PDFDocument.load(out, { updateMetadata: false });
+  const check = await PDFDocument.load(out, LOAD);
   if (check.getPageCount() !== pages.length) throw new Error('Verificação do arquivo salvo falhou.');
 
   const tmp = job.dest + '.leitorpdf-tmp';

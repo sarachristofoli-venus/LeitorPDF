@@ -510,3 +510,68 @@ select.field:disabled { opacity: .5; }
 .img-acts { display: flex; justify-content: center; gap: 2px; }
 .img-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 20px; margin-top: 10px; }
 .img-dlg > p.small { margin: 6px 2px 0; }
+
+/* ---------- Editor de matéria ---------- */
+#editorPanel {
+  width: 380px; flex: none; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px 12px;
+  background: var(--surface-2); border-left: 1px solid var(--border); min-height: 0;
+}
+#editorPanel[hidden], body.no-doc #editorPanel { display: none; }
+.ed-head { display: flex; align-items: center; gap: 8px; }
+.ed-head strong { font-size: 14px; }
+.ed-status { flex: 1; font-size: 12px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ed-hint { margin: 0; font-size: 12px; }
+.ed-form { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; }
+.ed-row { display: flex; gap: 8px; }
+.ed-row .ed-field:first-child { flex: 1; }
+.ed-page { width: 96px; }
+.ed-field { display: flex; flex-direction: column; gap: 3px; border-radius: 8px; padding: 4px 6px 6px; border: 1px solid transparent; }
+.ed-field.on { border-color: var(--accent); background: var(--accent-soft); }
+.ed-field.grow { flex: 1; min-height: 120px; }
+.ed-label { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; color: var(--muted); min-height: 24px; cursor: default; }
+.ed-field.on .ed-label { color: var(--accent); }
+.ed-tools { display: flex; gap: 2px; }
+.ed-tools .icon-btn { width: 24px; height: 24px; }
+.ed-tools svg { width: 14px; height: 14px; }
+.ed-field input, .ed-field textarea {
+  width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px;
+  user-select: text; font: 13px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; resize: none;
+}
+.ed-field textarea { resize: vertical; }
+.ed-field.grow textarea { flex: 1; resize: none; }
+.ed-field input:focus, .ed-field textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.ed-page input { text-align: center; color: var(--muted); }
+.ed-opts { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.ed-opts .check { margin-left: 0; }
+.ed-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.ed-actions button { border-radius: 7px; padding: 6px 10px; cursor: pointer; }
+.ed-actions button.primary { padding: 6px 12px; margin-left: auto; }
+button.secondary { border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+button.secondary:hover:not(:disabled) { background: var(--hover); }
+button.secondary:disabled { opacity: .45; cursor: default; }
+.sb-send { border: 0; background: none; color: var(--accent); font-weight: 600; padding: 4px 8px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+.sb-send:hover { background: var(--accent-soft); }
+
+/* blocos na página: abaixo da camada de texto (a seleção continua funcionando) */
+.edLayer { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+body.ed-hide-blocks .edLayer { display: none; }
+.edBlock {
+  position: absolute; border: 1px solid rgba(214, 48, 49, 0.45); background: rgba(214, 48, 49, 0.035); border-radius: 2px;
+}
+.edBlock.table { border-color: rgba(0, 110, 200, 0.6); background: rgba(0, 110, 200, 0.04); }
+.edBlock.ocr { border: 1px dashed rgba(124, 77, 255, 0.85); background: rgba(124, 77, 255, 0.06); }
+.edBlock.used { border-color: rgba(30, 150, 70, 0.9); background: rgba(30, 150, 70, 0.16); }
+.edBlock.hover { border-color: var(--accent); background: rgba(214, 48, 49, 0.16); box-shadow: 0 0 0 1px var(--accent); }
+.edBlock.hover[data-tag]::before {
+  content: attr(data-tag); position: absolute; left: -1px; bottom: 100%; font: 600 9px/12px "Segoe UI", sans-serif;
+  padding: 0 4px; border-radius: 3px 3px 0 0; color: #fff; background: rgba(0, 110, 200, 0.85); white-space: nowrap;
+}
+.edBlock.ocr[data-tag]::before { background: rgba(124, 77, 255, 0.9); }
+.viewer.ed-over .page, .viewer.ed-over .textLayer span { cursor: pointer; }
+.edMark { position: absolute; z-index: 5; outline: 2px dashed var(--accent); outline-offset: 0; pointer-events: none; }
+.edHandle { position: absolute; pointer-events: auto; }
+.edHandle.n, .edHandle.s { left: 0; right: 0; height: 10px; cursor: ns-resize; }
+.edHandle.e, .edHandle.w { top: 0; bottom: 0; width: 10px; cursor: ew-resize; }
+.edHandle.n { top: -5px; } .edHandle.s { bottom: -5px; } .edHandle.w { left: -5px; } .edHandle.e { right: -5px; }
+body.night .edBlock { mix-blend-mode: normal; }
+body.presentation #editorPanel, body.presentation .edLayer, body.presentation .edMark { display: none; }

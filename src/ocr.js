@@ -18,21 +18,45 @@ export class OcrCancelled extends Error {
 }
 
 /**
- * Margem branca em volta da imagem antes do OCR. O Tesseract endireita fotos tortas girando a imagem
- * sem aumentar o quadro; sem margem, o que está nos cantos sai do quadro e não é lido.
- * 4,5% do lado maior em cada lado cobre inclinações de até ~10°.
+ * Imagem da página para o Tesseract, já com margem branca, no formato PPM (pixels crus). Entregar o canvas
+ * faria o Tesseract.js comprimir tudo em PNG e o worker descomprimir de novo: o resultado é idêntico, mas
+ * o PPM poupa ~1 s numa página de jornal.
+ * Margem: o Tesseract endireita fotos tortas girando a imagem sem aumentar o quadro; sem margem, o que está
+ * nos cantos sai do quadro e não é lido. 4,5% do lado maior em cada lado cobre inclinações de até ~10°.
  */
-function withMargin(canvas) {
-  const pad = Math.ceil(0.045 * Math.max(canvas.width, canvas.height));
-  const c = document.createElement('canvas');
-  c.width = canvas.width + 2 * pad;
-  c.height = canvas.height + 2 * pad;
-  const ctx = c.getContext('2d', { alpha: false, willReadFrequently: true });
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(0, 0, c.width, c.height);
-  ctx.drawImage(canvas, pad, pad);
+function toPpm(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const pad = Math.ceil(0.045 * Math.max(w, h));
+  const W = w + 2 * pad, H = h + 2 * pad;
+  const head = new TextEncoder().encode(`P6\n${W} ${H}\n255\n`);
+  const out = new Uint8Array(head.length + W * H * 3);
+  out.set(head);
+  out.fill(255, head.length);
+  const { data } = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h);
   canvas.width = canvas.height = 0; // libera a memória do original
-  return { canvas: c, pad };
+  for (let y = 0; y < h; y++) {
+    let j = head.length + ((y + pad) * W + pad) * 3;
+    for (let i = y * w * 4, end = i + w * 4; i < end; i += 4, j += 3) {
+      const a = data[i + 3];
+      if (a === 255) {
+        out[j] = data[i]; out[j + 1] = data[i + 1]; out[j + 2] = data[i + 2];
+      } else { // transparência sobre fundo branco
+        const k = a / 255, bg = 255 - a;
+        out[j] = data[i] * k + bg; out[j + 1] = data[i + 1] * k + bg; out[j + 2] = data[i + 2] * k + bg;
+      }
+    }
+  }
+  return { image: out, width: W, height: H, pad };
+}
+
+/**
+ * Quantos workers do Tesseract usar: cada um lê uma página por vez (~200 MB de memória numa página grande).
+ * Deixa dois núcleos livres para a interface e limita pela memória do computador.
+ */
+function poolSize(total) {
+  const cores = navigator.hardwareConcurrency || 2;
+  const mem = navigator.deviceMemory || 4; // GB (o Chromium informa no máximo 8)
+  return Math.max(1, Math.min(total, cores - 2, mem >= 8 ? 6 : mem >= 4 ? 3 : 2));
 }
 
 /**
@@ -43,7 +67,7 @@ function withMargin(canvas) {
  */
 export async function recognizeAll(jobs, { lang = 'por+eng', onProgress, onPage, signal = { cancelled: false } } = {}) {
   const total = jobs.length;
-  const size = Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 2) - 1, total));
+  const size = poolSize(total);
   const partial = new Array(size).fill(0);
   let done = 0;
   const report = () => onProgress?.(done, total, (done + partial.reduce((a, b) => a + b, 0)) / total);
@@ -55,6 +79,7 @@ export async function recognizeAll(jobs, { lang = 'por+eng', onProgress, onPage,
   aborted.catch(() => {});
   const guard = (p) => Promise.race([p, aborted]);
   const workers = [];
+  let finished = false;
   signal.terminate = () => {
     abort(new OcrCancelled());
     workers.forEach((w) => w.terminate().catch(() => {}));
@@ -62,8 +87,8 @@ export async function recognizeAll(jobs, { lang = 'por+eng', onProgress, onPage,
   if (signal.cancelled) throw new OcrCancelled();
 
   try {
-    for (let i = 0; i < size; i++) {
-      if (signal.cancelled) throw new OcrCancelled();
+    // Os workers são criados ao mesmo tempo (cada um carrega o motor e os idiomas).
+    const pool = await guard(Promise.all(Array.from({ length: size }, async (_, i) => {
       const creating = Tesseract.createWorker(lang, 1, {
         workerPath: WORKER_PATH,
         corePath: CORE_PATH,
@@ -75,14 +100,17 @@ export async function recognizeAll(jobs, { lang = 'por+eng', onProgress, onPage,
           if (m.status === 'recognizing text') { partial[i] = m.progress || 0; report(); }
         },
       });
-      creating.then((w) => { if (signal.cancelled) w.terminate().catch(() => {}); }, () => {});
-      const worker = await guard(creating);
-      workers.push(worker);
+      creating.then((w) => {
+        if (finished || signal.cancelled) w.terminate().catch(() => {});
+        else workers.push(w);
+      }, () => {});
+      const worker = await creating;
       // Segmentação automática da página (PSM 3): detecta colunas, títulos, legendas e fotos.
       // Sem isso o Tesseract.js trata a página como um bloco único e junta as linhas de colunas vizinhas
       // (numa página de jornal: 23 de 33 linhas misturavam colunas e o erro subia de 0,5% para 3,3%).
-      await guard(worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO }));
-    }
+      await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO });
+      return worker;
+    })));
     const results = new Array(total);
     let next = 0;
     const loop = async (w, i) => {
@@ -94,14 +122,14 @@ export async function recognizeAll(jobs, { lang = 'por+eng', onProgress, onPage,
         partial[i] = 0;
         let geo = {};
         if (image instanceof HTMLCanvasElement) {
-          const m = withMargin(image);
-          image = m.canvas;
-          geo = { width: image.width, height: image.height, pad: m.pad };
+          const p = toPpm(image);
+          image = p.image;
+          geo = { width: p.width, height: p.height, pad: p.pad };
         }
         // rotateAuto: o Tesseract mede a inclinação (foto torta, digitalização enviesada) e endireita a imagem
         // antes de analisar o layout; sem isso, linhas inclinadas são confundidas com colunas e picotadas.
         const { data } = await guard(w.recognize(image, { rotateAuto: !!geo.width }, { blocks: true, text: false }));
-        if (image instanceof HTMLCanvasElement) image.width = image.height = 0; // libera a memória
+        image = null;
         results[idx] = wordsFromBlocks(data.blocks, { angle: data.rotateRadians || 0, ...geo });
         partial[i] = 0;
         done++;
@@ -109,12 +137,13 @@ export async function recognizeAll(jobs, { lang = 'por+eng', onProgress, onPage,
         onPage?.(idx, results[idx]);
       }
     };
-    await Promise.all(workers.map((w, i) => loop(w, i)));
+    await Promise.all(pool.map((w, i) => loop(w, i)));
     return results;
   } catch (err) {
     if (signal.cancelled) throw new OcrCancelled();
     throw err;
   } finally {
+    finished = true;
     await Promise.all(workers.map((w) => w.terminate().catch(() => {})));
   }
 }
@@ -229,7 +258,7 @@ function reorderColumns(segs) {
  * início e o fim da linha de base (bx0,by0 → bx1,by1), a espessura da linha e um número de trecho,
  * em pixels da imagem entregue pelo job. A ordem dos blocos é a ordem de leitura do Tesseract.
  * @param geo.angle  inclinação corrigida pelo Tesseract (a imagem foi girada em torno do centro, mesmo tamanho)
- * @param geo.pad    margem branca acrescentada em cada lado (withMargin)
+ * @param geo.pad    margem branca acrescentada em cada lado (toPpm)
  */
 export function wordsFromBlocks(blocks, { angle = 0, width = 0, height = 0, pad = 0 } = {}) {
   // Coordenadas da imagem endireitada → gira de volta (−angle) → tira a margem = imagem original

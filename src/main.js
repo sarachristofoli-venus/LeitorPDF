@@ -1,10 +1,9 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, dialog, shell, protocol, Menu, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, protocol, Menu, clipboard, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { saveAnnotations } = require('./pdf-annotations');
 
 const ROOT = app.getAppPath();
 const OCR_CORE_DIR = (() => {
@@ -32,7 +31,8 @@ const MIME = {
 
 // Protocolo interno app:// — evita as restrições de file:// para módulos ES e o worker do PDF.js
 protocol.registerSchemesAsPrivileged([
-  { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } },
+  // codeCache: o V8 guarda o código já compilado (PDF.js, OCR…) e as próximas aberturas ficam mais rápidas
+  { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, codeCache: true } },
 ]);
 
 let win = null;
@@ -234,9 +234,38 @@ if (!app.requestSingleInstanceLock()) {
       return res.canceled ? null : res.filePath;
     });
 
+    // arquivos gerados na interface (recorte da matéria em JPG/PNG)
+    const SAVE_FILTERS = {
+      jpg: [{ name: 'Imagem JPEG', extensions: ['jpg', 'jpeg'] }],
+      png: [{ name: 'Imagem PNG', extensions: ['png'] }],
+    };
+    ipcMain.handle('save-file', async (_e, defaultPath, bytes, ext) => {
+      if (!SAVE_FILTERS[ext]) throw new Error('Tipo de arquivo não permitido');
+      let file;
+      if (process.env.LEITOR_AUTOSAVE_DIR) file = path.join(process.env.LEITOR_AUTOSAVE_DIR, path.basename(String(defaultPath)));
+      else {
+        const res = await dialog.showSaveDialog(win, {
+          title: 'Salvar como', defaultPath: String(defaultPath || ''), filters: SAVE_FILTERS[ext] || [],
+        });
+        if (res.canceled) return null;
+        file = res.filePath;
+      }
+      if (!SAVE_FILTERS[ext][0].extensions.includes(path.extname(file).slice(1).toLowerCase())) file += '.' + ext;
+      await fs.promises.writeFile(file, Buffer.from(bytes));
+      return file;
+    });
+
+    ipcMain.handle('copy-image', (_e, bytes) => {
+      const img = nativeImage.createFromBuffer(Buffer.from(bytes));
+      if (img.isEmpty()) return false;
+      clipboard.writeImage(img);
+      return true;
+    });
+
     ipcMain.handle('save-annotations', async (_e, job) => {
       try {
-        return await saveAnnotations(job);
+        // carregado só na hora de salvar, para não atrasar a abertura do programa
+        return await require('./pdf-annotations').saveAnnotations(job);
       } catch (err) {
         const busy = ['EBUSY', 'EPERM', 'EACCES'].includes(err?.code);
         return { error: busy ? 'locked' : 'failed', message: err?.message || String(err) };

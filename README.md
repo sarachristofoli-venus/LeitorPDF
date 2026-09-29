@@ -60,6 +60,42 @@ Pressione **F1** no app para ver todos os atalhos de teclado.
 - **Letras pequenas**: imagens de até ~1900 px são ampliadas 2× antes do OCR.
 - **Refazer o OCR**: escolha *Todas as páginas*; a camada de texto anterior é substituída, sem duplicar.
 
+## Editor de matéria
+
+Inspirado no *Editor Impresso* do Akaii (clipping de jornais): botão **Editor de matéria** na barra ou tecla **E**.
+
+- A página é dividida em **blocos**: título, subtítulo, linha do autor, cada coluna, legenda, tabela.
+  O texto vem do próprio PDF. Com *Ler texto nas imagens* ligado, anúncios, logotipos e páginas digitalizadas
+  passam pelo OCR e viram blocos também (tracejados em roxo).
+- Clique num campo (Editoria, Título, Subtítulo, Autor, Conteúdo) e depois nos blocos. O texto é emendado como
+  no Akaii: desfaz a hifenização entre colunas, abre parágrafo depois de ponto final e continua a frase nos
+  outros casos. **Ctrl+clique** troca o conteúdo do campo. Um trecho selecionado pode ser enviado ao campo pela
+  barra flutuante.
+- Melhorias em relação ao Akaii:
+  - a **letra capitular** é unida ao texto ("V" + "itória" vira "Vitória"; "O" + "que" continua "O que");
+  - **tabelas** (vagas do SINE, gastos públicos) viram um bloco só, com as linhas preservadas;
+  - a linha do autor é limpa ("Por Fulano / Foto: Divulgação" vira "Fulano").
+- A **área da matéria** é marcada na página, com bordas ajustáveis. *Salvar recorte* gera um JPG em 200 dpi,
+  e *Copiar recorte* manda a imagem para a área de transferência. *Copiar matéria* copia todos os campos.
+- **Esc** limpa tudo para a próxima matéria; *Desfazer* retira o último bloco.
+
+## Desempenho
+
+Medido com um jornal de 10 páginas (fotos CMYK), um livro de 600 páginas e um PDF digitalizado de 40 páginas:
+
+- **Abertura:** a biblioteca de gravação (pdf-lib) só é carregada na hora de salvar e o código compilado
+  fica em cache (V8 code cache no protocolo `app://`): o programa abre ~0,1 s mais rápido.
+- **Salvar:** o pdf-lib pausava a cada 50–100 objetos (~15 ms por pausa no Windows). Sem as pausas, um PDF com
+  8 mil objetos passou de 7,5 s para 0,2 s.
+- **Busca:** o texto é lido em paralelo por até 4 workers do PDF.js (documentos com 60 ou mais páginas), e a
+  leitura começa quando a barra de busca abre. No livro de 600 páginas: 6,8 s → 1,7 s.
+- **Memória:** o PDF.js guarda as imagens já decodificadas só das 12 páginas usadas por último, então rolar
+  documentos longos não acumula memória (−10% a −25% nos testes, com três documentos abertos).
+- **Prioridade:** miniaturas e tarefas de fundo esperam as páginas da tela terminarem de desenhar.
+- **OCR:** a imagem chega ao Tesseract em pixels crus (PPM), sem comprimir e descomprimir um PNG (~15% mais
+  rápido, texto idêntico). Os workers iniciam juntos, e a quantidade se ajusta aos núcleos e à memória do
+  computador (até 6).
+
 ### Aceleração por GPU
 Vem **desligada** por padrão: o PDF.js já desenha as páginas na CPU, e em alguns drivers a GPU travava por
 ~20 s ao ler imagens grandes (OCR, impressão). Para religar, feche o app e adicione `"gpu": true` ao arquivo
