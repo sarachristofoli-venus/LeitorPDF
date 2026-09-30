@@ -1,15 +1,16 @@
 {
   "name": "leitor-pdf",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "main": "src/main.js",
   "scripts": {
-    "start": "electron .",
-    "dist": "electron-builder --win nsis",
+    "start": "node scripts/build-winocr.cjs && electron .",
+    "dist": "node scripts/build-winocr.cjs && electron-builder --win nsis",
+    "winocr": "node scripts/build-winocr.cjs --force",
     "icon": "python scripts/make_icon.py"
   },
   "author": "Sara Christofoli",
   "license": "MIT",
-  "description": "Leitor de PDF com anotações, OCR e criação de PDF a partir de imagens",
+  "description": "Leitor de PDF com anotações, OCR (Windows ou Tesseract), editor de matéria e criação de PDF a partir de imagens",
   "dependencies": {
     "@tesseract.js-data/eng": "^1.0.0",
     "@tesseract.js-data/por": "^1.0.0",
@@ -59,12 +60,18 @@
       "!node_modules/tesseract.js-core/tesseract-core-simd-lstm.js",
       "!node_modules/tesseract.js-core/tesseract-core-relaxedsimd-lstm.js",
       "!node_modules/@tesseract.js-data/*/4.0.0/**",
-    "!node_modules/pdf-lib/cjs/**",
-    "!node_modules/pdf-lib/es/**",
-    "!node_modules/pdf-lib/src/**",
-    "!node_modules/pdf-lib/ts3.4/**",
-    "!node_modules/pdf-lib/dist/pdf-lib.js",
-    "!node_modules/pdf-lib/dist/pdf-lib.esm.js"
+      "!node_modules/pdf-lib/cjs/**",
+      "!node_modules/pdf-lib/es/**",
+      "!node_modules/pdf-lib/src/**",
+      "!node_modules/pdf-lib/ts3.4/**",
+      "!node_modules/pdf-lib/dist/pdf-lib.js",
+      "!node_modules/pdf-lib/dist/pdf-lib.esm.js"
+    ],
+    "extraResources": [
+      {
+        "from": "build/winocr.exe",
+        "to": "winocr.exe"
+      }
     ],
     "win": {
       "target": [

@@ -223,6 +223,9 @@ body.night .thumb .frame { background: #222; }
 .textLayer[data-main-rotation="90"] { transform: rotate(90deg) translateY(-100%); }
 .textLayer[data-main-rotation="180"] { transform: rotate(180deg) translate(-100%, -100%); }
 .textLayer[data-main-rotation="270"] { transform: rotate(270deg) translateX(-100%); }
+/* canvas que o PDF.js põe no fim do <body> para medir o texto enquanto monta as camadas: sem esta regra ele
+   aparecia (300×150) e empurrava a tela por um instante */
+.hiddenCanvasElement { position: absolute; top: 0; left: 0; width: 0; height: 0; display: none; }
 .textLayer :is(span, br) { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; }
 /* o texto fica acima do .endOfContent, que cobre a camada durante a seleção */
 .textLayer > :not(.markedContent), .textLayer .markedContent span:not(.markedContent) { z-index: 1; }
@@ -509,6 +512,8 @@ select.field:disabled { opacity: .5; }
 .img-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .img-acts { display: flex; justify-content: center; gap: 2px; }
 .img-opts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 20px; margin-top: 10px; }
+.img-opts .wide { grid-column: 1 / -1; }
+.img-opts p.wide { margin: 0; }
 .img-dlg > p.small { margin: 6px 2px 0; }
 
 /* ---------- Editor de matéria ---------- */

@@ -60,6 +60,90 @@ function writeJson(file, data) {
   }
 }
 
+// ---------------------------------------------------------------- OCR do Windows
+// O winocr.exe (native/WinOcr.cs) leva as imagens ao reconhecedor de texto do Windows (Windows.Media.Ocr).
+// É aberto no primeiro OCR e fecha sozinho depois de um minuto parado, liberando a memória dos modelos.
+const WINOCR_EXE = app.isPackaged ? path.join(process.resourcesPath, 'winocr.exe') : path.join(ROOT, 'build', 'winocr.exe');
+const WINOCR_IDLE = 60000;
+let winOcr = null; // { proc, ready: Promise<{langs, max}|null>, pending: Map, idle }
+let winOcrSeq = 0;
+
+function winOcrStart() {
+  if (winOcr) return winOcr.ready;
+  if (process.platform !== 'win32' || !fs.existsSync(WINOCR_EXE)) return Promise.resolve(null);
+  let proc;
+  try {
+    proc = require('child_process').spawn(WINOCR_EXE, [], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+  } catch {
+    return Promise.resolve(null);
+  }
+  const me = { proc, pending: new Map(), idle: null };
+  winOcr = me;
+  me.ready = new Promise((resolve) => {
+    const timer = setTimeout(() => { resolve(null); proc.kill(); }, 15000);
+    require('readline').createInterface({ input: proc.stdout, crlfDelay: Infinity }).on('line', (line) => {
+      let msg;
+      try { msg = JSON.parse(line); } catch { return; }
+      if (msg.ready) {
+        clearTimeout(timer);
+        resolve({ langs: msg.langs || [], max: msg.max || 0 });
+        winOcrIdle(me);
+        return;
+      }
+      const p = me.pending.get(msg.id);
+      if (!p) return;
+      me.pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error));
+      else p.resolve({ angle: msg.angle, lines: msg.lines, ms: msg.ms });
+      winOcrIdle(me);
+    });
+    const gone = () => {
+      clearTimeout(timer);
+      resolve(null);
+      if (winOcr === me) winOcr = null;
+      for (const p of me.pending.values()) p.reject(new Error('O OCR do Windows foi encerrado'));
+      me.pending.clear();
+    };
+    proc.on('error', gone);
+    proc.on('exit', gone);
+    proc.stdin.on('error', () => {});
+  });
+  return me.ready;
+}
+
+function winOcrIdle(me) {
+  clearTimeout(me.idle);
+  if (me.pending.size) return;
+  me.idle = setTimeout(() => {
+    if (me.pending.size) return;
+    if (winOcr === me) winOcr = null; // o próximo OCR abre outro processo
+    me.proc.stdin.end(); // o processo termina ao ver a entrada fechada
+  }, WINOCR_IDLE);
+}
+
+async function winOcrRecognize(lang, width, height, gray) {
+  const info = await winOcrStart();
+  const me = winOcr;
+  if (!info || !me) throw new Error('OCR do Windows indisponível');
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 ||
+      width > info.max || height > info.max || !(gray instanceof Uint8Array) || gray.length !== width * height) {
+    throw new Error('Imagem inválida para o OCR do Windows');
+  }
+  clearTimeout(me.idle);
+  const id = ++winOcrSeq;
+  const lb = Buffer.from(String(lang), 'utf8');
+  const head = Buffer.alloc(16);
+  head.writeInt32LE(id, 0);
+  head.writeInt32LE(width, 4);
+  head.writeInt32LE(height, 8);
+  head.writeInt32LE(lb.length, 12);
+  return new Promise((resolve, reject) => {
+    me.pending.set(id, { resolve, reject });
+    me.proc.stdin.write(Buffer.concat([head, lb]));
+    me.proc.stdin.write(Buffer.from(gray.buffer, gray.byteOffset, gray.byteLength));
+  });
+}
+
 function pdfArgs(argv, cwd = process.cwd()) {
   return argv
     .slice(1)
@@ -278,8 +362,12 @@ if (!app.requestSingleInstanceLock()) {
       return true;
     });
 
+    ipcMain.handle('ocr-win-info', () => winOcrStart());
+    ipcMain.handle('ocr-win', (_e, lang, width, height, gray) => winOcrRecognize(lang, width, height, gray));
+
     createWindow();
   });
 
   app.on('window-all-closed', () => app.quit());
+  app.on('will-quit', () => winOcr?.proc.kill());
 }

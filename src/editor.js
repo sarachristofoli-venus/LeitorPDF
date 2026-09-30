@@ -777,7 +777,7 @@ export class NewsEditor {
         return canvas;
       });
     }
-    const results = await OCR.recognizeAll(jobs, { lang: 'por+eng', signal });
+    const results = await OCR.recognizeAll(jobs, { engine: this.h.store.ocrEngine, lang: 'por+eng', signal });
     check();
 
     // palavras do OCR → quadro exibido → blocos

@@ -45,18 +45,31 @@ Pressione **F1** no app para ver todos os atalhos de teclado.
 
 ## OCR e imagens
 
-- O OCR usa o [Tesseract](https://github.com/tesseract-ocr/tesseract) (via Tesseract.js) e roda **no seu computador**,
-  sem internet. Idiomas incluídos: português e inglês.
+- O OCR roda **no seu computador**, sem internet, com um de dois motores (escolha em *Motor do OCR*):
+  - **OCR do Windows** (padrão): o reconhecedor de texto com IA que já vem no Windows 10 e 11
+    (`Windows.Media.Ocr`). Nos testes com páginas de jornal foi **~15× mais rápido** que o Tesseract, com a
+    mesma precisão ou melhor:
+
+    | Teste | OCR do Windows | Tesseract |
+    |---|---|---|
+    | Página de jornal com gabarito digitado (erro por letra) | 0,8 s · 0,11% | 6,9 s · 0,49% |
+    | 10 páginas do jornal em JPG de 200 dpi (palavras encontradas) | 3,0 s · 97,7% | 46,6 s · 97,9% |
+    | PDF digitalizado de 40 páginas (fluxo completo) | 9,2 s | 54,7 s |
+
+    Usa o idioma instalado no Windows (português do Brasil já vem no Windows em português). Se o idioma não
+    estiver instalado, ou em outro sistema, o app usa o Tesseract automaticamente.
+  - **[Tesseract](https://github.com/tesseract-ocr/tesseract)** (via Tesseract.js): mais lento, incluso no app
+    com português e inglês; também lê créditos de foto escritos na vertical.
 - **PDF digitalizado:** o app avisa quando o PDF não tem texto. Clique em *Reconhecer texto (OCR)* (ou Ctrl+Shift+O).
   O texto reconhecido fica invisível sobre a imagem da página: pode ser selecionado, copiado e pesquisado,
   aqui e em qualquer outro leitor. Salve com Ctrl+S.
 - **Imagens:** arraste várias fotos (JPG, PNG, WebP, BMP, GIF) para a janela ou use *Criar PDF a partir de imagens*.
   A orientação das fotos de celular é corrigida automaticamente; as páginas podem ser reordenadas e giradas.
 - PDFs protegidos contra alteração recebem uma **cópia** com o texto reconhecido (o original não é modificado).
-- **Layout em colunas** (jornais, revistas): o Tesseract roda em modo de segmentação automática (PSM 3), que
-  separa colunas, títulos, legendas e fotos. Assim, selecionar uma coluna copia só aquela coluna.
+- **Layout em colunas** (jornais, revistas): os dois motores separam colunas, títulos, legendas e fotos
+  (o Tesseract em modo de segmentação automática, PSM 3). Assim, selecionar uma coluna copia só aquela coluna.
 - **Fotos tortas / digitalizações enviesadas**: a inclinação é medida e corrigida antes da leitura; o texto
-  invisível é posicionado de volta sobre a imagem original.
+  invisível é posicionado de volta sobre a imagem original (conferido com a página de teste girada até 15°).
 - **Letras pequenas**: imagens de até ~1900 px são ampliadas 2× antes do OCR.
 - **Refazer o OCR**: escolha *Todas as páginas*; a camada de texto anterior é substituída, sem duplicar.
 
@@ -92,9 +105,12 @@ Medido com um jornal de 10 páginas (fotos CMYK), um livro de 600 páginas e um 
 - **Memória:** o PDF.js guarda as imagens já decodificadas só das 12 páginas usadas por último, então rolar
   documentos longos não acumula memória (−10% a −25% nos testes, com três documentos abertos).
 - **Prioridade:** miniaturas e tarefas de fundo esperam as páginas da tela terminarem de desenhar.
-- **OCR:** a imagem chega ao Tesseract em pixels crus (PPM), sem comprimir e descomprimir um PNG (~15% mais
-  rápido, texto idêntico). Os workers iniciam juntos, e a quantidade se ajusta aos núcleos e à memória do
-  computador (até 6).
+- **OCR:** o OCR do Windows lê várias páginas ao mesmo tempo (~0,1 s por página de jornal em paralelo) e o
+  processo que conversa com ele fecha sozinho depois de um minuto parado. No Tesseract, a imagem chega em pixels
+  crus (PPM), sem comprimir e descomprimir um PNG (~15% mais rápido, texto idêntico), e os workers iniciam
+  juntos, na quantidade que os núcleos e a memória do computador permitem (até 6).
+- **Tela estável:** o canvas que o PDF.js usa para medir o texto ficava visível por um instante e empurrava a
+  página enquanto as camadas de texto eram montadas; agora fica oculto.
 
 ### Aceleração por GPU
 Vem **desligada** por padrão: o PDF.js já desenha as páginas na CPU, e em alguns drivers a GPU travava por
@@ -134,7 +150,9 @@ Outra opção é ativar o Modo de Desenvolvedor do Windows.
 - `src/annotations.js`: modelo e geometria das anotações (seleção → quadriláteros do PDF) e desenho
 - `src/selection.js`: estabilização da seleção, clique triplo e limpeza do texto copiado
 - `src/pdf-annotations.js`: gravação das anotações no PDF (pdf-lib), no processo principal
-- `src/ocr.js`: OCR com Tesseract.js (vários processos em paralelo, 100% local)
+- `src/ocr.js`: OCR com o OCR do Windows ou o Tesseract.js (várias páginas em paralelo, 100% local)
+- `native/WinOcr.cs`: ponte para o OCR do Windows (`build/winocr.exe`, compilado por `scripts/build-winocr.cjs`
+  com o compilador C# que já vem no Windows; `npm start` e `npm run dist` compilam sozinhos)
 - `src/pdfbuild.js`: camada de texto invisível e montagem de PDF a partir de imagens (pdf-lib)
 - `src/index.html`, `src/styles.css`: a interface
 - `build/`: ícones; `scripts/`: geração do ícone, PDF de teste e testes

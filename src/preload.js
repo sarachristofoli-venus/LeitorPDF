@@ -19,6 +19,8 @@ contextBridge.exposeInMainWorld('leitor', {
   saveFile: (defaultPath, bytes, ext) => ipcRenderer.invoke('save-file', defaultPath, bytes, ext),
   copyImage: (bytes) => ipcRenderer.invoke('copy-image', bytes),
   saveAnnotations: (job) => ipcRenderer.invoke('save-annotations', job),
+  ocrWinInfo: () => ipcRenderer.invoke('ocr-win-info'),
+  ocrWin: (lang, width, height, gray) => ipcRenderer.invoke('ocr-win', lang, width, height, gray),
   sidecarGet: (file) => ipcRenderer.invoke('sidecar-get', file),
   sidecarSet: (file, data) => ipcRenderer.invoke('sidecar-set', file, data),
   pathForFile: (file) => webUtils.getPathForFile(file),

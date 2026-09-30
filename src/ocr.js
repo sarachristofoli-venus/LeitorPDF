@@ -1,5 +1,8 @@
-// OCR (reconhecimento de texto) com Tesseract.js, 100% local: nada é enviado para a internet.
-// Os arquivos do motor e dos idiomas são servidos pelo protocolo interno app://.
+// OCR (reconhecimento de texto), 100% local: nada é enviado para a internet.
+// Dois motores: o OCR do Windows (Windows.Media.Ocr, reconhecedor com IA que vem no sistema: ~15× mais
+// rápido e com menos erros nas páginas de jornal de teste) e o Tesseract.js, usado quando o do Windows não
+// está disponível (outro sistema, idioma não instalado) ou quando escolhido nas opções.
+// Os arquivos do Tesseract (motor e idiomas) são servidos pelo protocolo interno app://.
 import Tesseract from '../node_modules/tesseract.js/dist/tesseract.esm.min.js';
 
 const NM = new URL('../node_modules/', import.meta.url).href;
@@ -11,6 +14,11 @@ export const LANGS = [
   ['por+eng', 'Português + Inglês'],
   ['por', 'Português'],
   ['eng', 'Inglês'],
+];
+
+export const ENGINES = [
+  ['windows', 'OCR do Windows (rápido)'],
+  ['tesseract', 'Tesseract (mais lento)'],
 ];
 
 export class OcrCancelled extends Error {
@@ -62,10 +70,155 @@ function poolSize(total) {
 /**
  * Reconhece o texto de várias imagens em paralelo.
  * @param {Array<() => Promise<HTMLCanvasElement>>} jobs  funções que produzem a imagem de cada página
- * @param {{lang?:string, onProgress?:(done:number,total:number,frac:number)=>void, onPage?:(i:number, words:object[])=>void, signal?:{cancelled:boolean, terminate?:()=>void}}} opts
+ * @param {{engine?:'windows'|'tesseract', lang?:string, onProgress?:(done:number,total:number,frac:number)=>void, onPage?:(i:number, words:object[])=>void, signal?:{cancelled:boolean, terminate?:()=>void}}} opts
  * @returns {Promise<object[][]>} palavras de cada imagem (coordenadas em pixels da imagem entregue pelo job)
  */
-export async function recognizeAll(jobs, { lang = 'por+eng', onProgress, onPage, signal = { cancelled: false } } = {}) {
+export async function recognizeAll(jobs, opts = {}) {
+  const { engine = 'windows', lang = 'por+eng', signal = { cancelled: false } } = opts;
+  if (engine === 'windows') {
+    const winLang = windowsLang(await windowsOcr(), lang);
+    if (signal.cancelled) throw new OcrCancelled();
+    if (winLang) {
+      try {
+        return await recognizeWindows(jobs, { ...opts, winLang, signal });
+      } catch (err) {
+        if (signal.cancelled || err?.name === 'OcrCancelled') throw new OcrCancelled();
+        console.warn('OCR do Windows falhou; usando o Tesseract.', err);
+      }
+    }
+  }
+  return recognizeTesseract(jobs, { ...opts, signal });
+}
+
+// ------------------------------------------------------------------ OCR do Windows
+
+let winInfo = null;
+
+/** Idiomas do OCR do Windows ({langs, max}), ou null se ele não estiver disponível neste computador. */
+export function windowsOcr() {
+  winInfo ??= Promise.resolve(globalThis.leitor?.ocrWinInfo?.())
+    .catch(() => null)
+    .then((info) => {
+      if (!info?.langs?.length) { winInfo = null; return null; } // tenta de novo na próxima vez
+      return info;
+    });
+  return winInfo;
+}
+
+/**
+ * Idioma do OCR do Windows para o idioma escolhido ('por+eng' e 'por' → português; 'eng' → inglês), ou null
+ * se ele não estiver instalado no Windows. O modelo de português também lê o inglês que aparece no texto.
+ */
+export function windowsLang(info, lang) {
+  const want = /^por/.test(lang) ? 'pt' : /^eng/.test(lang) ? 'en' : null;
+  const tags = (info?.langs || []).filter((t) => t.toLowerCase().split('-')[0] === want);
+  return tags.find((t) => /^(pt-br|en-us)$/i.test(t)) || tags[0] || null;
+}
+
+/**
+ * Imagem em tons de cinza para o OCR do Windows, com margem branca: sem ela, o OCR ignora o texto encostado
+ * na borda de imagens pequenas (um recorte de uma linha só não era lido).
+ */
+function toGray(canvas) {
+  const w = canvas.width, h = canvas.height;
+  const pad = Math.max(32, Math.ceil(0.02 * Math.max(w, h)));
+  const W = w + 2 * pad, H = h + 2 * pad;
+  const out = new Uint8Array(W * H).fill(255);
+  const { data } = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h);
+  canvas.width = canvas.height = 0; // libera a memória do original
+  for (let y = 0; y < h; y++) {
+    let j = (y + pad) * W + pad;
+    for (let i = y * w * 4, end = i + w * 4; i < end; i += 4, j++) {
+      const v = (data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) >> 8;
+      const a = data[i + 3];
+      out[j] = a === 255 ? v : (v * a + 255 * (255 - a)) / 255; // transparência sobre fundo branco
+    }
+  }
+  return { gray: out, width: W, height: H, pad };
+}
+
+/**
+ * Quantas imagens mandar ao mesmo tempo. O OCR do Windows lê várias em paralelo (8 páginas de jornal em
+ * 0,8 s); o limite é a memória das páginas desenhadas à espera.
+ */
+function windowsPool(total) {
+  const cores = navigator.hardwareConcurrency || 2;
+  const mem = navigator.deviceMemory || 4;
+  return Math.max(1, Math.min(total, cores - 1, mem >= 8 ? 4 : 2));
+}
+
+async function recognizeWindows(jobs, { winLang, onProgress, onPage, signal }) {
+  const total = jobs.length;
+  let abort;
+  const aborted = new Promise((_, reject) => { abort = reject; });
+  aborted.catch(() => {});
+  const guard = (p) => Promise.race([p, aborted]);
+  signal.terminate = () => abort(new OcrCancelled());
+  if (signal.cancelled) throw new OcrCancelled();
+  const results = new Array(total);
+  let next = 0, done = 0;
+  onProgress?.(0, total, 0);
+  const loop = async () => {
+    while (next < total) {
+      if (signal.cancelled) throw new OcrCancelled();
+      const idx = next++;
+      const canvas = await guard(jobs[idx]());
+      if (signal.cancelled) throw new OcrCancelled();
+      if (!(canvas instanceof HTMLCanvasElement)) throw new Error('imagem em formato inesperado');
+      const img = toGray(canvas);
+      const res = await guard(globalThis.leitor.ocrWin(winLang, img.width, img.height, img.gray));
+      results[idx] = wordsFromWindows(res, img);
+      done++;
+      onProgress?.(done, total, done / total);
+      onPage?.(idx, results[idx]);
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: windowsPool(total) }, loop));
+    return results;
+  } catch (err) {
+    if (signal.cancelled) throw new OcrCancelled();
+    throw err;
+  }
+}
+
+// letras que descem abaixo da linha de base (e pontuação que também desce)
+const DESCENDERS = /[gjpqyçQJ,;()[\]{}|/_]/;
+
+/**
+ * Converte o resultado do OCR do Windows (linhas → palavras com retângulos) no mesmo formato de palavras do
+ * Tesseract: início e fim da linha de base, espessura da linha e número da linha, em pixels da imagem
+ * entregue pelo job. Numa foto torta o Windows mede a inclinação (angle) e devolve as posições na imagem
+ * endireitada; elas são giradas de volta em torno do centro (conferido com a página de teste girada até 15°).
+ */
+export function wordsFromWindows({ angle, lines }, { width, height, pad = 0 }) {
+  const t = ((angle || 0) * Math.PI) / 180, cos = Math.cos(t), sin = Math.sin(t);
+  const cx = width / 2, cy = height / 2;
+  const back = (x, y) => [cx + (x - cx) * cos - (y - cy) * sin - pad, cy + (x - cx) * sin + (y - cy) * cos - pad];
+  const out = [];
+  let n = 0;
+  for (const line of lines || []) {
+    const words = line.filter((w) => w[0].trim());
+    if (!words.length) continue;
+    n++;
+    const top = Math.min(...words.map((w) => w[2]));
+    const bottom = Math.max(...words.map((w) => w[2] + w[4]));
+    const size = Math.max(1, bottom - top);
+    // linha de base: fundo das palavras sem letras que descem (p, g, ç…) e que não são só pontuação
+    const base = median(words.filter((w) => /[\p{L}\p{N}]/u.test(w[0]) && !DESCENDERS.test(w[0])).map((w) => w[2] + w[4]))
+      ?? bottom - size * 0.2;
+    for (const [text, x, , w] of words) {
+      const [bx0, by0] = back(x, base);
+      const [bx1, by1] = back(x + w, base);
+      out.push({ text: text.trim(), bx0, by0, bx1, by1, size, line: n });
+    }
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ Tesseract
+
+async function recognizeTesseract(jobs, { lang = 'por+eng', onProgress, onPage, signal = { cancelled: false } } = {}) {
   const total = jobs.length;
   const size = poolSize(total);
   const partial = new Array(size).fill(0);

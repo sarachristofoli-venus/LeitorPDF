@@ -2413,7 +2413,8 @@ async function showOcrDialog(d) {
   const body = el('div', 'form');
   body.append(el('p', null, 'O reconhecimento de texto (OCR) transforma páginas digitalizadas ou fotografadas em texto que pode ser selecionado, copiado e pesquisado. Tudo é processado no seu computador, sem internet.'));
   const langSel = makeSelect(OCR.LANGS, store.ocrLang || 'por+eng');
-  body.append(formRow('Idioma do texto', langSel));
+  const engine = await engineControl(OCR, langSel);
+  body.append(formRow('Idioma do texto', langSel), engine.row, engine.note);
   body.append(el('div', 'form-label', 'Páginas'));
   const radio = (value, label, checked) => {
     const r = el('label', 'check-row');
@@ -2432,8 +2433,40 @@ async function showOcrDialog(d) {
   ]);
   if (v !== 'ok') return;
   store.ocrLang = langSel.value;
+  engine.save();
   saveStore();
   await ocrDocument(d, { lang: langSel.value, mode: body.querySelector('input[name=ocrPages]:checked').value });
+}
+
+/**
+ * Escolha do motor de OCR (OCR do Windows ou Tesseract), guardada em store.ocrEngine e usada também pelo
+ * editor de matéria. Quando o Windows não tem OCR para o idioma escolhido, avisa que será usado o Tesseract.
+ */
+async function engineControl(OCR, langSel) {
+  const info = await OCR.windowsOcr();
+  const sel = makeSelect(OCR.ENGINES, store.ocrEngine || 'windows');
+  const note = el('p', 'muted small');
+  let chosen = sel.value;
+  const sync = () => {
+    const ok = !!OCR.windowsLang(info, langSel.value);
+    sel.options[0].disabled = !ok;
+    sel.value = ok ? chosen : 'tesseract';
+    note.textContent = ok ? '' : info
+      ? 'O Windows deste computador não tem o OCR deste idioma instalado; será usado o Tesseract.'
+      : 'O OCR do Windows não está disponível neste computador; será usado o Tesseract.';
+    note.hidden = ok;
+  };
+  sel.addEventListener('change', () => { if (!sel.options[0].disabled) chosen = sel.value; });
+  langSel.addEventListener('change', sync);
+  sync();
+  const row = formRow('Motor do OCR', sel);
+  return {
+    row,
+    note,
+    set disabled(v) { sel.disabled = v; },
+    save() { if (!sel.options[0].disabled) store.ocrEngine = sel.value; },
+    get value() { return sel.value; },
+  };
 }
 
 async function ocrDocument(d, { lang, mode }) {
@@ -2508,6 +2541,7 @@ async function ocrDocument(d, { lang, mode }) {
       return canvas;
     });
     const results = await OCR.recognizeAll(jobs, {
+      engine: store.ocrEngine,
       lang,
       signal,
       onProgress: (done, total, frac) => prog.set(
@@ -2609,9 +2643,12 @@ async function showImagesDialog(paths) {
   const optimize = makeCheck('Reduzir o tamanho do arquivo', store.imgOptimize ?? true);
   const ocr = makeCheck('Reconhecer texto (OCR): permite selecionar, copiar e pesquisar o texto', store.imgOcr ?? true);
   const langSel = makeSelect(OCR.LANGS, store.ocrLang || 'por+eng');
-  langSel.disabled = !ocr.input.checked;
-  ocr.input.addEventListener('change', () => { langSel.disabled = !ocr.input.checked; });
-  opts.append(formRow('Tamanho da página', sizeSel), formRow('Idioma do texto', langSel), optimize.row, ocr.row);
+  const engine = await engineControl(OCR, langSel);
+  langSel.disabled = engine.disabled = !ocr.input.checked;
+  ocr.input.addEventListener('change', () => { langSel.disabled = engine.disabled = !ocr.input.checked; });
+  ocr.row.classList.add('wide');
+  engine.note.classList.add('wide');
+  opts.append(formRow('Tamanho da página', sizeSel), optimize.row, ocr.row, formRow('Idioma do texto', langSel), engine.row, engine.note);
   wrap.append(head, grid, el('p', 'muted small', 'Arraste as miniaturas para mudar a ordem das páginas.'), opts);
 
   const byName = (a, b) => a.name.localeCompare(b.name, 'pt-BR', { numeric: true });
@@ -2693,6 +2730,7 @@ async function showImagesDialog(paths) {
   try {
     if (v === 'ok' && items.length) {
       Object.assign(store, { imgSize: sizeSel.value, imgOptimize: optimize.input.checked, imgOcr: ocr.input.checked, ocrLang: langSel.value });
+      if (ocr.input.checked) engine.save();
       saveStore();
       await createPdfFromImages(items, { size: sizeSel.value, optimize: optimize.input.checked, ocr: ocr.input.checked, lang: langSel.value });
     }
@@ -2749,6 +2787,7 @@ async function createPdfFromImages(items, opts) {
         return canvas;
       });
       const results = await OCR.recognizeAll(jobs, {
+        engine: store.ocrEngine,
         lang: opts.lang,
         signal,
         onProgress: (done, total, frac) => prog.set(
